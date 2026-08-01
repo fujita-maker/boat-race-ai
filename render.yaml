@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: wdj-boat-race-ai
+    runtime: docker
+    plan: starter
+    autoDeploy: true
+    disk:
+      name: boat-race-data
+      mountPath: /app
+      sizeGB: 1
