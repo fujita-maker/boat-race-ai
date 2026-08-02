@@ -19,7 +19,7 @@ import requests
 import streamlit as st
 
 
-APP_NAME = "WDJ Boat Race AI Web版 V30.4 VERIFIED"
+APP_NAME = "WDJ Boat Race AI Web版 V30.5 VERIFIED"
 JST = timezone(timedelta(hours=9))
 PAYBACK_RATE = 0.75  # 3連単の平均払戻率(控除率25%). edge計測の基準に使用.
 
@@ -834,11 +834,285 @@ def replay_staking(joined: list[dict[str, Any]], init: float = 300000.0) -> list
     return out
 
 
+# ============================================================
+# 選手データ解析 と 新UI描画 (V30.5)
+# ============================================================
+def _to_f(s: Any) -> float | None:
+    try:
+        return float(str(s))
+    except Exception:
+        return None
+
+
+def parse_umepyon_racers(text: str) -> dict[int, dict[str, Any]]:
+    """梅吉のボートレーサー欄から 枠→氏名/級別/年齢/体重/平均ST/モーター2連率 を取得。"""
+    out: dict[int, dict[str, Any]] = {}
+    if not text:
+        return out
+    pat = re.compile(
+        r"([1-6])\s*枠\s*([^\(（0-9]+?)\s*[\(（](A1|A2|B1|B2)[\)）]\s*"
+        r"(\d+)\s*歳\s*/\s*([\d.]+)\s*kg[^S]*?ST\s*([\d.]+)[^\d]{0,4}([\d.]+)"
+    )
+    for m in pat.finditer(text):
+        lane = int(m.group(1))
+        out[lane] = {
+            "lane": lane,
+            "name": re.sub(r"\s+", " ", m.group(2)).strip(),
+            "cls": m.group(3),
+            "age": m.group(4),
+            "weight": m.group(5),
+            "st": m.group(6),
+            "motor2": _to_f(m.group(7)),
+        }
+    return out
+
+
+def parse_racelist_stats(text: str, names: dict[int, str]) -> dict[int, dict[str, Any]]:
+    """公式出走表から 全国勝率/全国2連率/当地勝率/当地2連率 を氏名を起点に抽出(ベストエフォート)。
+    氏名直後の小数列 [体重, ST, 全国勝率, 全国2連, 全国3連, 当地勝率, 当地2連, 当地3連, ...] を利用。
+    値域チェックで妥当なものだけ採用。取れなければ空。"""
+    out: dict[int, dict[str, Any]] = {}
+    if not text:
+        return out
+    for lane, nm in names.items():
+        chars = [re.escape(c) for c in nm if not c.isspace()]
+        if not chars:
+            continue
+        m = re.search(r"\s*".join(chars), text)  # 氏名を空白ゆらぎ許容で検索
+        if not m:
+            continue
+        tail = text[m.end(): m.end() + 120]      # 元テキスト(空白保持)から数値列を取得
+        decs = re.findall(r"\d+\.\d+", tail)
+        # 期待: [0]体重 [1]ST [2]全国勝率 [3]全国2連 [4]全国3連 [5]当地勝率 [6]当地2連
+        if len(decs) >= 7:
+            try:
+                nat_win = float(decs[2]); nat_2 = float(decs[3])
+                loc_win = float(decs[5]); loc_2 = float(decs[6])
+                if 0 <= nat_win <= 8 and 0 <= nat_2 <= 100 and 0 <= loc_win <= 8:
+                    out[lane] = {
+                        "nat_win": nat_win, "nat_2": nat_2,
+                        "loc_win": loc_win, "loc_2": loc_2,
+                    }
+            except Exception:
+                pass
+    return out
+
+
+def calc_score(r: dict[str, Any]) -> int:
+    """取得できた成績から総合指数(0-100)を算出。梅吉の能力指数は数値公開が無いため独自算出。"""
+    s = 52.0
+    nw = r.get("nat_win"); n2 = r.get("nat_2"); mo = r.get("motor2"); st = _to_f(r.get("st"))
+    if nw is not None: s += (nw - 3.5) * 9
+    if n2 is not None: s += (n2 - 15) * 0.45
+    if mo is not None: s += (mo - 30) * 0.6
+    if st is not None: s += (0.18 - st) * 120
+    return int(max(28, min(99, round(s))))
+
+
+def build_racers(sources: dict[str, Any]) -> list[dict[str, Any]]:
+    """梅吉(基本情報)＋公式出走表(成績)を統合して6艇の選手データを作る。"""
+    base = parse_umepyon_racers(sources.get("umepyon", ""))
+    if not base:
+        return []
+    names = {ln: r["name"] for ln, r in base.items()}
+    official_text = " ".join(sources.get("official", {}).values())
+    stats = parse_racelist_stats(official_text, names)
+    racers = []
+    for lane in range(1, 7):
+        if lane not in base:
+            continue
+        r = dict(base[lane])
+        r.update(stats.get(lane, {}))
+        r["score"] = calc_score(r)
+        racers.append(r)
+    return racers
+
+
+LANE_STYLE = {
+    1: ("#f3f3ef", "#33404f", "1px solid #cbc4b4"),
+    2: ("#2b2b2b", "#ffffff", "none"),
+    3: ("#b8433c", "#ffffff", "none"),
+    4: ("#356a99", "#ffffff", "none"),
+    5: ("#d7a531", "#463610", "none"),
+    6: ("#4b8a63", "#ffffff", "none"),
+}
+
+WDJ_CSS = """
+<style>
+.stApp{background:radial-gradient(135% 95% at 50% -12%,#f3f5f7 0%,#e9ecee 55%,#e0e4e7 100%);}
+.wdj *{box-sizing:border-box}
+.wdj{font-family:"Hiragino Kaku Gothic ProN","Yu Gothic",Meiryo,sans-serif;color:#1f2a36;max-width:680px;margin:0 auto}
+.wmn{font-family:"Hiragino Mincho ProN","Yu Mincho",serif}
+.wcard{background:#fff;border:1px solid #ecebe3;border-radius:14px;padding:14px 16px;margin-bottom:10px;box-shadow:0 8px 22px -18px rgba(31,42,54,.5)}
+.wverdict{display:flex;align-items:center;gap:20px}
+.wring{flex:0 0 84px;width:84px;height:84px;border-radius:50%;display:grid;place-items:center;position:relative}
+.wring::after{content:"";position:absolute;inset:9px;border-radius:50%;background:#fff}
+.wring .v{position:relative;z-index:1;text-align:center}
+.wring .v b{font-size:23px;font-weight:600}.wring .v small{display:block;font-size:10px;color:#5f6b76;letter-spacing:.14em}
+.wv .lbl{font-size:10.5px;color:#5f6b76;letter-spacing:.14em}
+.wv .big{font-size:30px;font-weight:600;line-height:1.15;margin:2px 0 8px}
+.wchip{font-size:11px;padding:3px 10px;border-radius:999px;border:1px solid #ecebe3;color:#5f6b76;margin-right:6px}
+.wchip.ev{border-color:#e3d7bd;color:#b0894a}
+.wsect{font-size:11px;letter-spacing:.16em;color:#5f6b76;margin:16px 4px 10px;display:flex;align-items:center;gap:10px}
+.wsect::after{content:"";flex:1;height:1px;background:#dfe2e0}
+.wsect .note{letter-spacing:0;font-size:10px;color:#95a0aa}
+.wlane{width:25px;height:25px;border-radius:6px;display:grid;place-items:center;font-size:13px;font-weight:700;flex:0 0 25px}
+.whd{display:flex;align-items:center;gap:10px}
+.wnm{font-size:14.5px;font-weight:600}.wcls{font-size:10px;color:#5f6b76;margin-left:6px;border:1px solid #ecebe3;padding:1px 5px;border-radius:4px}
+.wsc{margin-left:auto;font-size:11px;color:#5f6b76}.wsc b{font-size:17px;color:#b0894a;font-weight:600;font-family:"Hiragino Mincho ProN",serif}
+.wstr{position:relative;height:8px;border-radius:5px;background:#eef0ec;margin:9px 0 9px}
+.wstr i{display:block;height:100%;border-radius:5px;background:linear-gradient(90deg,#dcb872,#b0894a)}
+.wstr s{position:absolute;top:-3px;bottom:-3px;left:75%;width:2px;background:#9c6a39;opacity:.55}
+.wrow{display:flex;gap:15px;font-size:11px;color:#5f6b76;margin-bottom:3px}
+.wrow b{color:#1f2a36;font-weight:600;margin-left:4px}
+.wrow .lb{width:30px;flex:0 0 30px;font-size:9.5px;color:#8b96a0;border:1px solid #ecebe3;border-radius:4px;text-align:center;padding:1px 0}
+.wcombo{font-size:22px;font-weight:600;letter-spacing:.1em}
+.wprob{font-size:14px}.wprob b{font-size:16px;font-weight:600}.wprob small{color:#5f6b76;font-size:10.5px}
+.wbar{height:9px;border-radius:5px;background:#eef0ec;overflow:hidden;display:flex;margin:8px 0 7px}
+.wbar .p{background:#22506a}.wbar .u{background:#bf9448}
+.wsub{font-size:10.5px;color:#5f6b76}.wsub .d{display:inline-block;width:9px;height:9px;border-radius:3px;vertical-align:middle;margin:0 4px 0 10px}
+.wodds{text-align:right;font-size:14px;font-weight:600}.wodds .na{color:#b9b09c;font-weight:500;font-size:12.5px}
+.wsrc{display:flex;gap:8px;margin-top:14px}
+.wsrc .c{flex:1;background:#fff;border:1px solid #ecebe3;border-radius:12px;padding:11px 8px;text-align:center}
+.wsrc .n{font-size:10px;color:#5f6b76}.wsrc .s{font-size:13px;font-weight:600;margin-top:4px}.wsrc .s.ok{color:#2f7a55}
+.wsrc .led{width:6px;height:6px;border-radius:50%;display:inline-block;margin-right:5px}.wsrc .led.ok{background:#2f7a55}
+</style>
+"""
+
+
+def _pf(v: Any) -> float | None:
+    """'14.85%' や数値を float に。'-'や未取得は None。"""
+    if v is None:
+        return None
+    m = re.search(r"[\d.]+", str(v))
+    return float(m.group()) if m else None
+
+
+def render_racers_html(racers: list[dict[str, Any]]) -> str:
+    if not racers:
+        return ('<div class="wsect">6 艇 の 実 力 ・ 選 手 デ ー タ</div>'
+                '<div class="wcard" style="color:#8b96a0;font-size:12px">'
+                '選手データを解析できませんでした（梅吉の取得状況をご確認ください）。</div>')
+    html = ('<div class="wsect">6 艇 の 実 力 ・ 選 手 デ ー タ'
+            '<span class="note">縦線＝目安平均｜総合指数は独自算出</span></div>')
+    for r in racers:
+        bg, fg, bd = LANE_STYLE.get(r["lane"], LANE_STYLE[1])
+        cls = html_lib.escape(str(r.get("cls", "")))
+        nm = html_lib.escape(str(r.get("name", "")))
+        age = r.get("age", ""); score = r.get("score", 0)
+        st = r.get("st", "-"); mo = r.get("motor2")
+        mo_s = f"{mo:.1f}%" if mo is not None else "-"
+        rows = (f'<div class="wrow"><span>平均ST<b>{st}</b></span>'
+                f'<span>モーター2連率<b>{mo_s}</b></span></div>')
+        if r.get("nat_win") is not None:
+            rows += (f'<div class="wrow"><span class="lb">全国</span>'
+                     f'<span>勝率<b>{r["nat_win"]:.2f}</b></span>'
+                     f'<span>2連率<b>{r["nat_2"]:.0f}%</b></span></div>')
+        if r.get("loc_win") is not None:
+            rows += (f'<div class="wrow"><span class="lb">当地</span>'
+                     f'<span>勝率<b>{r["loc_win"]:.2f}</b></span>'
+                     f'<span>2連率<b>{r["loc_2"]:.0f}%</b></span></div>')
+        html += (
+            f'<div class="wcard">'
+            f'<div class="whd"><span class="wlane" style="background:{bg};color:{fg};border:{bd}">{r["lane"]}</span>'
+            f'<span class="wnm">{nm}</span><span class="wcls">{cls}・{age}歳</span>'
+            f'<span class="wsc">総合指数 <b>{score}</b></span></div>'
+            f'<div class="wstr"><i style="width:{score}%"></i><s></s></div>'
+            f'{rows}</div>'
+        )
+    return html
+
+
+def render_bets_html(prediction: dict[str, Any], config: dict[str, Any]) -> str:
+    bets = prediction.get("bets", [])
+    wp = float(config.get("poseidon_weight", 0.72))
+    wu = float(config.get("umepyon_weight", 0.28))
+    rows = []
+    max_tot = 0.001
+    for b in bets:
+        blend = _pf(b.get("推定確率")) or 0
+        pose = _pf(b.get("ポセイドン確率")); ume = _pf(b.get("梅吉確率"))
+        seg_p = (pose * wp) if pose else (blend if ume is None else 0)
+        seg_u = (ume * wu) if ume else 0
+        tot = seg_p + seg_u or blend
+        max_tot = max(max_tot, tot)
+        rows.append((b, blend, pose, ume, seg_p, seg_u))
+    html = ('<div class="wsect">買 い 目 ・ 統 合 予 想'
+            '<span class="note">青=ポセイドン / 金=梅吉</span></div>')
+    for i, (b, blend, pose, ume, seg_p, seg_u) in enumerate(rows, 1):
+        odds = b.get("オッズ")
+        if isinstance(odds, (int, float)):
+            odds_html = f'<div class="wodds">{odds:g}<span style="font-size:11px">倍</span></div>'
+        else:
+            odds_html = '<div class="wodds"><span class="na">未取得</span></div>'
+        wpid = seg_p / max_tot * 100
+        wuid = seg_u / max_tot * 100
+        sub = (f'<span class="wsub"><span class="d" style="background:#22506a"></span>'
+               f'ポセイドン {pose:.1f}%</span>' if pose else '')
+        sub += (f'<span class="wsub"><span class="d" style="background:#bf9448"></span>'
+                f'梅吉 {ume:.1f}%</span>' if ume else '')
+        html += (
+            f'<div class="wcard" style="display:grid;grid-template-columns:24px 1fr auto;gap:14px;align-items:center">'
+            f'<div style="font-size:15px;color:#5f6b76;text-align:center">{i}</div>'
+            f'<div><div style="display:flex;align-items:baseline;gap:12px;margin-bottom:8px">'
+            f'<span class="wcombo wmn">{html_lib.escape(str(b.get("買い目","")))}</span>'
+            f'<span class="wprob"><b>{blend:.1f}</b><small>%</small></span></div>'
+            f'<div class="wbar"><i class="p" style="width:{wpid:.1f}%"></i>'
+            f'<i class="u" style="width:{wuid:.1f}%"></i></div>'
+            f'<div>{sub}</div></div>'
+            f'{odds_html}</div>'
+        )
+    return html
+
+
+def render_sources_html(official_odds_count: int, poseidon_count: int,
+                        umepyon_count: int, official_any: bool) -> str:
+    if official_odds_count > 0:
+        o = f"オッズ{official_odds_count}通り"
+    elif official_any:
+        o = "オッズ未公開"
+    else:
+        o = "取得失敗"
+    p = f"{poseidon_count}点" if poseidon_count else "—"
+    u = f"{umepyon_count}点" if umepyon_count else "—"
+    def cell(name, val):
+        return (f'<div class="c"><div class="n">{name}</div>'
+                f'<div class="s ok"><span class="led ok"></span>{val}</div></div>')
+    return ('<div class="wsrc">' + cell("BOAT RACE公式", o)
+            + cell("ポセイドン", p) + cell("梅吉AI", u) + '</div>')
+
+
+def render_result_html(venue: str, race_no: int, race_date: Any,
+                       prediction: dict[str, Any], racers: list[dict[str, Any]],
+                       config: dict[str, Any], srcs: tuple) -> str:
+    conf = int(prediction.get("confidence", 0))
+    action = html_lib.escape(str(prediction.get("action", "")))
+    cls = html_lib.escape(str(prediction.get("classification", "")))
+    ev = prediction.get("avg_ev", 0)
+    ring = (f'<div class="wring" style="background:conic-gradient(#1f6f7d {conf}%,#e9e3d7 0)">'
+            f'<div class="v"><b class="wmn">{conf}</b><small>自信度</small></div></div>')
+    verdict = (
+        f'<div class="wcard wverdict">{ring}<div class="wv">'
+        f'<div class="lbl">最 終 判 断</div><div class="big wmn">{action}</div>'
+        f'<div><span class="wchip">{cls}</span>'
+        f'<span class="wchip ev">参考期待値 {ev}</span></div></div></div>'
+    )
+    head = (f'<div style="text-align:center;margin:6px 0 14px">'
+            f'<span class="wmn" style="font-size:22px;font-weight:600">{html_lib.escape(venue)}</span>'
+            f'<span class="wmn" style="font-size:22px"> {race_no}R</span>'
+            f'<span style="font-size:12px;color:#5f6b76;margin-left:10px">{race_date}</span></div>')
+    return ('<div class="wdj">' + head + verdict
+            + render_racers_html(racers)
+            + render_bets_html(prediction, config)
+            + render_sources_html(*srcs) + '</div>')
+
+
 init_db()
 st.set_page_config(page_title=APP_NAME, layout="wide")
-st.title("🚤 WDJ ボートレースAI Web版 V30.4 VERIFIED")
+st.markdown(WDJ_CSS, unsafe_allow_html=True)
+st.title("🚤 WDJ ボートレースAI Web版 V30.5 VERIFIED")
 st.caption(
-    "BUILD: V30.4-VERIFIED-20260803｜公式取得のタイムアウト延長＋再試行。予想の永続記録・実データでのedge/資金戦略検証。"
+    "BUILD: V30.5-VERIFIED-20260803｜新UI(選手データ＋統合買い目)。永続記録・実データedge検証。"
 )
 
 tabs = st.tabs(["予想", "過去5年収集", "学習・検証", "データ確認", "収支・edge検証"])
@@ -870,43 +1144,21 @@ with tabs[0]:
         prediction = result["prediction"]
         sources = result["sources"]
 
-        st.success(f"{venue}{race_no}R｜{prediction['action']}")
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("最終判断", prediction["action"])
-        m2.metric("分類", prediction["classification"])
-        m3.metric("自信度", f"{prediction['confidence']}%")
-        m4.metric("参考期待値", prediction["avg_ev"])
-
-        st.subheader("🎯 買い目")
-        st.table(prediction["bets"])
-
         official_text = " ".join(sources.get("official", {}).values())
         official_odds_count = len(parse_odds(official_text))
         poseidon_count = len(parse_site_probabilities(sources.get("poseidon", "")))
         umepyon_count = len(parse_site_probabilities(sources.get("umepyon", "")))
+        official_any = any(sources.get("official", {}).values())
 
-        s1, s2, s3 = st.columns(3)
-
-        if official_odds_count > 0:
-            s1.metric("BOAT RACE公式", f"オッズ取得 {official_odds_count}通り")
-        elif any(sources.get("official", {}).values()):
-            s1.metric("BOAT RACE公式", "ページ取得・オッズ未公開")
-        else:
-            s1.metric("BOAT RACE公式", "取得失敗")
-
-        if poseidon_count > 0:
-            s2.metric("ポセイドン", f"予想解析 {poseidon_count}点")
-        elif sources.get("poseidon_error"):
-            s2.metric("ポセイドン", "取得失敗")
-        else:
-            s2.metric("ポセイドン", "解析0点")
-
-        if umepyon_count > 0:
-            s3.metric("梅吉AI", f"予想解析 {umepyon_count}点")
-        elif sources.get("umepyon_error"):
-            s3.metric("梅吉AI", "取得失敗")
-        else:
-            s3.metric("梅吉AI", "解析0点")
+        racers = build_racers(sources)
+        st.markdown(
+            render_result_html(
+                venue, race_no, race_date, prediction, racers,
+                get_model_config(),
+                (official_odds_count, poseidon_count, umepyon_count, official_any),
+            ),
+            unsafe_allow_html=True,
+        )
 
         if official_odds_count == 0:
             st.info(
