@@ -1,0 +1,41 @@
+# WDJ ボートレースAI Web版 V30.3 VERIFIED
+
+V30.2（公式のHTTP取得化＋梅吉パース修正）に加え、
+**「データが貯まって賢くなる」土台**を追加した版です。
+
+## V30.3 の追加
+
+1. **データの永続化**：DBの保存先を環境変数 `APP_DATA_DIR` で指定可能に。
+   Renderの永続ディスク（`/var/data`）を使えば、再起動・再デプロイしてもデータが消えません。
+   （`render.yaml` に disk と envVar を追加済み）
+2. **予想の自動記録**：予想を出すたびに買い目・オッズ・確率をDBへ保存（既存機能を永続DB上で活用）。
+3. **収支・edge検証タブ（新）**：記録した予想と実際のレース結果を突き合わせ、
+   実データでの「的中率／回収率／edge(優位性)」と「どの掛け金戦略が資金を増やすか」を算出。
+   タブ内の「予想済みレースの結果を自動収集」ボタンで公式結果をまとめて取得。
+
+## edge が本物かを測る手順（重要）
+
+過去に遡ってAIの予想は復元できません（外部サイトが過去予想を保存していないため）。
+そのため実データは **今日から前向きに** 積み上がります：
+
+1. 「予想」タブで、**オッズ発売後**に予想を出す（自動記録される）
+2. レース確定後、「収支・edge検証」タブで **結果を自動収集**
+3. レースが貯まるほど、回収率・edge・最適な資金戦略が正確になる（目安100レース以上）
+
+## Render 側の設定（永続ディスク）
+
+`render.yaml` を反映すれば自動で付きますが、手動の場合：
+1. 対象サービス → Settings → Disks → Add Disk
+2. Mount Path = `/var/data`、Size = 1GB
+3. Environment に `APP_DATA_DIR = /var/data` を追加
+4. Manual Deploy → Clear build cache & deploy
+
+## 画面での反映確認
+
+- タイトル：`WDJ ボートレースAI Web版 V30.3 VERIFIED`
+- BUILD：`V30.3-VERIFIED-20260803`
+- タブに「収支・edge検証」が追加されていること
+
+## GitHubへ上書きするファイル
+
+app.py / Dockerfile / requirements.txt / render.yaml / README.md / VERSION.txt / SHA256SUMS.txt
