@@ -1,7 +1,0 @@
-services:
-  - type: web
-    name: boat-race-ai-v20
-    runtime: docker
-    plan: starter
-    autoDeploy: true
-    healthCheckPath: /
