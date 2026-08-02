@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: boat-race-ai-v21
+    name: boat-race-ai-v22
     runtime: docker
     plan: starter
     autoDeploy: true

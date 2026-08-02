@@ -1,19 +1,19 @@
-# WDJ Boat Race AI V21
+# WDJ Boat Race AI V22 Stable
 
-GitHubのWebアップロードでフォルダ構成が崩れない、単一app.py版です。
+Segmentation fault対策版です。
 
-## アップロードするファイル
+## 主な変更
+- pandasを削除
+- BeautifulSoupを削除
+- HTML処理を標準ライブラリ中心に変更
+- requirementsをStreamlitとrequestsだけに削減
+- 過去収集を1回100ページ以下に制限
+- 単一app.py構成を維持
+
+GitHubへ以下の5ファイルを上書きしてください。
 
 - app.py
 - Dockerfile
 - requirements.txt
 - render.yaml
 - README.md
-
-以前の `ui`、`collector`、`database`、`predictor`、`trainer` フォルダは不要です。
-
-## Render
-
-GitHubへ上書き後：
-
-`Manual Deploy → Clear build cache & deploy`

@@ -1,6 +1,8 @@
 
 from __future__ import annotations
 
+import csv
+import html as html_lib
 import itertools
 import json
 import math
@@ -8,25 +10,21 @@ import re
 import sqlite3
 import time
 from datetime import date, datetime, timedelta, timezone
+from io import StringIO
 from pathlib import Path
 from typing import Any
 
-import pandas as pd
 import requests
 import streamlit as st
-from bs4 import BeautifulSoup
 
 
-# =========================================================
-# 基本設定
-# =========================================================
-APP_NAME = "WDJ Boat Race AI Web版 V21"
+APP_NAME = "WDJ Boat Race AI Web版 V22 Stable"
 JST = timezone(timedelta(hours=9))
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
-DB_PATH = DATA_DIR / "boat_race_v21.db"
+DB_PATH = DATA_DIR / "boat_race_v22.db"
 
 VENUES = {
     "桐生":"01","戸田":"02","江戸川":"03","平和島":"04","多摩川":"05","浜名湖":"06",
@@ -41,13 +39,11 @@ HEADERS = {
         "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151 Safari/537.36"
     )
 }
-REQUEST_TIMEOUT = (5, 10)
-MAX_RESPONSE_BYTES = 1_500_000
+CONNECT_TIMEOUT = 4
+READ_TIMEOUT = 7
+MAX_RESPONSE_BYTES = 900_000
 
 
-# =========================================================
-# DB
-# =========================================================
 def db() -> sqlite3.Connection:
     con = sqlite3.connect(DB_PATH)
     con.row_factory = sqlite3.Row
@@ -66,11 +62,6 @@ def init_db() -> None:
           race_no INTEGER NOT NULL,
           actual_combo TEXT,
           payout_100 INTEGER DEFAULT 0,
-          weather TEXT,
-          wind_dir TEXT,
-          wind_speed REAL,
-          wave_height REAL,
-          winning_method TEXT,
           source_url TEXT,
           collected_at TEXT,
           UNIQUE(race_date, venue_code, race_no)
@@ -83,8 +74,6 @@ def init_db() -> None:
           ev_threshold REAL DEFAULT 1.10,
           max_bets INTEGER DEFAULT 8,
           updated_at TEXT DEFAULT '初期値',
-          training_rows INTEGER DEFAULT 0,
-          training_races INTEGER DEFAULT 0,
           backtest_roi REAL DEFAULT 0,
           backtest_profit INTEGER DEFAULT 0
         );
@@ -99,11 +88,8 @@ def init_db() -> None:
           venue TEXT,
           race_no INTEGER,
           action TEXT,
-          classification TEXT,
-          confidence REAL,
           expected_value REAL,
           bets_json TEXT,
-          sources_json TEXT,
           created_at TEXT
         );
         """
@@ -119,8 +105,6 @@ def get_model_config() -> dict[str, Any]:
         "ev_threshold":1.10,
         "max_bets":8,
         "updated_at":"初期値",
-        "training_rows":0,
-        "training_races":0,
         "backtest_roi":0.0,
         "backtest_profit":0,
     }
@@ -132,8 +116,7 @@ def save_model_config(config: dict[str, Any]) -> None:
         """
         UPDATE model_config SET
           poseidon_weight=?,umepyon_weight=?,ev_threshold=?,max_bets=?,
-          updated_at=?,training_rows=?,training_races=?,
-          backtest_roi=?,backtest_profit=?
+          updated_at=?,backtest_roi=?,backtest_profit=?
         WHERE id=1
         """,
         (
@@ -142,8 +125,6 @@ def save_model_config(config: dict[str, Any]) -> None:
             float(config["ev_threshold"]),
             int(config["max_bets"]),
             str(config["updated_at"]),
-            int(config["training_rows"]),
-            int(config["training_races"]),
             float(config["backtest_roi"]),
             int(config["backtest_profit"]),
         ),
@@ -156,69 +137,55 @@ def save_prediction(record: dict[str, Any]) -> None:
     con.execute(
         """
         INSERT INTO predictions(
-          race_date,venue,race_no,action,classification,confidence,
-          expected_value,bets_json,sources_json,created_at
-        ) VALUES(?,?,?,?,?,?,?,?,?,?)
+          race_date,venue,race_no,action,expected_value,bets_json,created_at
+        ) VALUES(?,?,?,?,?,?,?)
         """,
         (
             record["race_date"],
             record["venue"],
             int(record["race_no"]),
             record["action"],
-            record["classification"],
-            float(record["confidence"]),
             float(record["expected_value"]),
             json.dumps(record["bets"], ensure_ascii=False),
-            json.dumps(record["sources"], ensure_ascii=False),
             datetime.now(JST).isoformat(),
         ),
     )
     con.commit()
 
 
-# =========================================================
-# HTTP
-# =========================================================
-def fetch_text(url: str, retries: int = 1) -> str:
-    last_error: Exception | None = None
-    for attempt in range(retries + 1):
-        try:
-            with requests.get(
-                url,
-                headers=HEADERS,
-                timeout=REQUEST_TIMEOUT,
-                stream=True,
-                allow_redirects=True,
-            ) as response:
-                response.raise_for_status()
-                chunks: list[bytes] = []
-                total = 0
-                for chunk in response.iter_content(chunk_size=32768):
-                    if not chunk:
-                        continue
-                    remaining = MAX_RESPONSE_BYTES - total
-                    if remaining <= 0:
-                        break
-                    chunks.append(chunk[:remaining])
-                    total += min(len(chunk), remaining)
-                raw = b"".join(chunks)
-                return raw.decode(response.encoding or "utf-8", errors="replace")
-        except Exception as exc:
-            last_error = exc
-            if attempt < retries:
-                time.sleep(0.8)
-    raise RuntimeError(str(last_error))
+def fetch_text(url: str) -> str:
+    with requests.get(
+        url,
+        headers=HEADERS,
+        timeout=(CONNECT_TIMEOUT, READ_TIMEOUT),
+        stream=True,
+        allow_redirects=True,
+    ) as response:
+        response.raise_for_status()
+        chunks: list[bytes] = []
+        total = 0
+        for chunk in response.iter_content(chunk_size=16384):
+            if not chunk:
+                continue
+            remaining = MAX_RESPONSE_BYTES - total
+            if remaining <= 0:
+                break
+            chunks.append(chunk[:remaining])
+            total += min(len(chunk), remaining)
+        raw = b"".join(chunks)
+        return raw.decode(response.encoding or "utf-8", errors="replace")
 
 
-def html_to_text(html: str) -> str:
-    if not html:
+def html_to_text(raw_html: str) -> str:
+    if not raw_html:
         return ""
-    return BeautifulSoup(html, "html.parser").get_text(" ", strip=True)
+    text = re.sub(r"(?is)<script.*?>.*?</script>", " ", raw_html)
+    text = re.sub(r"(?is)<style.*?>.*?</style>", " ", text)
+    text = re.sub(r"(?s)<[^>]+>", " ", text)
+    text = html_lib.unescape(text)
+    return re.sub(r"\s+", " ", text).strip()
 
 
-# =========================================================
-# ライブ取得
-# =========================================================
 def live_urls(date8: str, date_iso: str, code: str, race_no: int) -> dict[str, str]:
     q = f"rno={race_no}&jcd={code}&hd={date8}"
     base = "https://www.boatrace.jp/owpc/pc/race"
@@ -234,77 +201,68 @@ def live_urls(date8: str, date_iso: str, code: str, race_no: int) -> dict[str, s
     }
 
 
+def safe_fetch(url: str) -> tuple[str, str | None]:
+    try:
+        return html_to_text(fetch_text(url)), None
+    except Exception as exc:
+        return "", str(exc)
+
+
 def fetch_live_sources(date8: str, date_iso: str, code: str, race_no: int) -> dict[str, Any]:
     urls = live_urls(date8, date_iso, code, race_no)
-    result: dict[str, Any] = {
-        "official":{},
-        "official_errors":[],
-        "poseidon":"",
-        "poseidon_error":None,
-        "umepyon":"",
-        "umepyon_error":None,
+    official: dict[str, str] = {}
+    official_errors: list[str] = []
+
+    for key in ("racelist", "before", "odds"):
+        text, error = safe_fetch(urls[key])
+        official[key] = text
+        if error:
+            official_errors.append(f"{key}: {error}")
+
+    poseidon, poseidon_error = safe_fetch(urls["poseidon"])
+    umepyon, umepyon_error = safe_fetch(urls["umepyon"])
+
+    return {
+        "official":official,
+        "official_errors":official_errors,
+        "poseidon":poseidon,
+        "poseidon_error":poseidon_error,
+        "umepyon":umepyon,
+        "umepyon_error":umepyon_error,
         "urls":urls,
     }
 
-    for key in ("racelist", "before", "odds"):
-        try:
-            result["official"][key] = html_to_text(fetch_text(urls[key], retries=0))
-        except Exception as exc:
-            result["official"][key] = ""
-            result["official_errors"].append(f"{key}: {exc}")
 
-    try:
-        result["poseidon"] = html_to_text(fetch_text(urls["poseidon"], retries=0))
-    except Exception as exc:
-        result["poseidon_error"] = str(exc)
-
-    try:
-        result["umepyon"] = html_to_text(fetch_text(urls["umepyon"], retries=0))
-    except Exception as exc:
-        result["umepyon_error"] = str(exc)
-
-    return result
-
-
-# =========================================================
-# パーサー
-# =========================================================
 def parse_odds(text: str) -> dict[str, float]:
     result: dict[str, float] = {}
-    patterns = [
+    for pattern in (
         r"\b([1-6])[-－\s]([1-6])[-－\s]([1-6])\s+([0-9]+(?:\.[0-9]+)?)\b",
         r"\b([1-6])\s*-\s*([1-6])\s*-\s*([1-6])\s*([0-9]+(?:\.[0-9]+)?)\b",
-    ]
-    for pattern in patterns:
+    ):
         for a, b, c, odds in re.findall(pattern, text):
             if len({a, b, c}) == 3:
                 result.setdefault(f"{a}-{b}-{c}", float(odds))
     return result
 
 
-def parse_poseidon(text: str) -> dict[str, float]:
+def parse_site_probabilities(text: str) -> dict[str, float]:
     result: dict[str, float] = {}
     for combo, prob in re.findall(
-        r"\b([1-6]-[1-6]-[1-6])\b.{0,50}?([0-9.]+)\s*%",
+        r"\b([1-6]-[1-6]-[1-6])\b.{0,60}?([0-9.]+)\s*%",
         text,
         re.S,
     ):
         if len(set(combo.split("-"))) == 3:
             result[combo] = max(result.get(combo, 0), float(prob))
-    return result
 
-
-def parse_umepyon(text: str) -> dict[str, float]:
-    result: dict[str, float] = {}
-    patterns = [
+    for a, b, c, prob in re.findall(
         r"\b([1-6])[-－>]([1-6])[-－>]([1-6])\b[^%]{0,80}?([0-9.]+)\s*%",
-        r"\b([1-6])\s+([1-6])\s+([1-6])\b[^%]{0,60}?([0-9.]+)\s*%",
-    ]
-    for pattern in patterns:
-        for a, b, c, prob in re.findall(pattern, text, re.S):
-            if len({a, b, c}) == 3:
-                combo = f"{a}-{b}-{c}"
-                result[combo] = max(result.get(combo, 0), float(prob))
+        text,
+        re.S,
+    ):
+        if len({a, b, c}) == 3:
+            combo = f"{a}-{b}-{c}"
+            result[combo] = max(result.get(combo, 0), float(prob))
     return result
 
 
@@ -316,30 +274,27 @@ def fallback_predictions() -> list[dict[str, Any]]:
         rows.append({"combo":f"{a}-{b}-{c}", "raw":raw})
     rows.sort(key=lambda row: row["raw"], reverse=True)
     top = rows[:12]
-    total = sum(math.exp((row["raw"] - top[0]["raw"]) / 18) for row in top)
+    denominator = sum(math.exp((row["raw"] - top[0]["raw"]) / 18) for row in top)
     for row in top:
         row["fallback_prob"] = round(
-            math.exp((row["raw"] - top[0]["raw"]) / 18) / total * 100,
+            math.exp((row["raw"] - top[0]["raw"]) / 18) / denominator * 100,
             2,
         )
     return top
 
 
-# =========================================================
-# 予想エンジン
-# =========================================================
 def build_prediction(source_data: dict[str, Any]) -> dict[str, Any]:
     config = get_model_config()
-
     official_text = " ".join(source_data.get("official", {}).values())
+
     odds_map = parse_odds(official_text)
-    pose_probs = parse_poseidon(source_data.get("poseidon", ""))
-    ume_probs = parse_umepyon(source_data.get("umepyon", ""))
+    pose_probs = parse_site_probabilities(source_data.get("poseidon", ""))
+    ume_probs = parse_site_probabilities(source_data.get("umepyon", ""))
 
     fallback_rows = fallback_predictions()
     fallback_map = {row["combo"]:row["fallback_prob"] for row in fallback_rows}
 
-    combos = set(pose_probs) | set(ume_probs) | set(odds_map)
+    combos = set(odds_map) | set(pose_probs) | set(ume_probs)
     if not combos:
         combos = set(fallback_map)
 
@@ -364,22 +319,19 @@ def build_prediction(source_data: dict[str, Any]) -> dict[str, Any]:
         odds = float(odds_map.get(combo, 0) or 0)
         ev = probability / 100 * odds if odds else 0
 
-        rows.append(
-            {
-                "combo":combo,
-                "model_prob":round(probability, 2),
-                "poseidon_prob":pose or None,
-                "umepyon_prob":ume or None,
-                "odds":round(odds, 1) if odds else 0,
-                "ev":round(ev, 3),
-            }
-        )
+        rows.append({
+            "combo":combo,
+            "model_prob":round(probability, 2),
+            "poseidon_prob":pose or None,
+            "umepyon_prob":ume or None,
+            "odds":round(odds, 1) if odds else 0,
+            "ev":round(ev, 3),
+        })
 
     rows.sort(key=lambda row: (row["model_prob"], row["ev"]), reverse=True)
 
     eligible_rows = [
-        row
-        for row in rows
+        row for row in rows
         if row["odds"] > 0 and row["ev"] >= float(config["ev_threshold"])
     ]
     eligible = len(eligible_rows) >= 3
@@ -389,9 +341,9 @@ def build_prediction(source_data: dict[str, Any]) -> dict[str, Any]:
             eligible_rows,
             key=lambda row: (row["ev"], row["model_prob"]),
             reverse=True,
-        )[: int(config["max_bets"])]
+        )[:int(config["max_bets"])]
     else:
-        selected = rows[: int(config["max_bets"])]
+        selected = rows[:int(config["max_bets"])]
 
     if not selected:
         selected = [
@@ -407,30 +359,34 @@ def build_prediction(source_data: dict[str, Any]) -> dict[str, Any]:
         ]
 
     budget = 5000 if eligible else 0
-    amount = 0
-    if budget and selected:
-        amount = max(100, (budget // len(selected) // 100) * 100)
+    amount = max(100, (budget // len(selected) // 100) * 100) if budget and selected else 0
 
     bets: list[dict[str, Any]] = []
     for rank, row in enumerate(selected, start=1):
         payout = int(amount * row["odds"]) if amount and row["odds"] else 0
-        bets.append(
-            {
-                **row,
-                "rank":rank,
-                "amount":amount if eligible else 0,
-                "return":payout,
-                "profit":payout - budget if payout else 0,
-            }
-        )
+        bets.append({
+            "順位":rank,
+            "買い目":row["combo"],
+            "オッズ":row["odds"] if row["odds"] else "未取得",
+            "購入額":amount if eligible else 0,
+            "的中時払戻":payout if payout else "未計算",
+            "推定確率":f"{row['model_prob']:.2f}%",
+            "期待値":row["ev"],
+            "ポセイドン確率":(
+                f"{row['poseidon_prob']:.2f}%"
+                if row["poseidon_prob"] is not None else "-"
+            ),
+            "梅吉確率":(
+                f"{row['umepyon_prob']:.2f}%"
+                if row["umepyon_prob"] is not None else "-"
+            ),
+        })
 
-    source_count = sum(
-        [
-            bool(source_data.get("official")),
-            not bool(source_data.get("poseidon_error")),
-            not bool(source_data.get("umepyon_error")),
-        ]
-    )
+    source_count = sum([
+        bool(source_data.get("official")),
+        not bool(source_data.get("poseidon_error")),
+        not bool(source_data.get("umepyon_error")),
+    ])
 
     return {
         "action":"買い" if eligible else "見送り",
@@ -443,13 +399,9 @@ def build_prediction(source_data: dict[str, Any]) -> dict[str, Any]:
         ),
         "bets":bets,
         "budget":budget,
-        "model_config":config,
     }
 
 
-# =========================================================
-# 過去結果収集
-# =========================================================
 def parse_historical_result(text: str) -> dict[str, Any] | None:
     match = re.search(
         r"3連単\s*([1-6])\s*[-－]\s*([1-6])\s*[-－]\s*([1-6])"
@@ -458,30 +410,9 @@ def parse_historical_result(text: str) -> dict[str, Any] | None:
     )
     if not match:
         return None
-
-    def first(patterns: list[str], default: str = "取得エラー") -> str:
-        for pattern in patterns:
-            found = re.search(pattern, text)
-            if found:
-                return found.group(1).strip()
-        return default
-
-    def as_float(value: str) -> float:
-        try:
-            return float(re.sub(r"[^0-9.\-]", "", value))
-        except Exception:
-            return 0.0
-
     return {
         "actual_combo":"-".join(match.group(i) for i in (1, 2, 3)),
         "payout_100":int(match.group(4).replace(",", "")),
-        "weather":first([r"(晴|曇り|雨|雪|霧)"]),
-        "wind_dir":first([r"(北東|北西|南東|南西|北|南|東|西)\s*風"]),
-        "wind_speed":as_float(first([r"風速\s*([0-9.]+)\s*m"], "0")),
-        "wave_height":as_float(first([r"波高\s*([0-9.]+)\s*cm"], "0")),
-        "winning_method":first(
-            [r"決まり手\s*(逃げ|差し|まくり|まくり差し|抜き|恵まれ)"]
-        ),
     }
 
 
@@ -491,24 +422,21 @@ def collect_historical_result(
     code: str,
     race_no: int,
 ) -> tuple[bool, str]:
-    date8 = race_date.strftime("%Y%m%d")
     url = (
         "https://www.boatrace.jp/owpc/pc/race/raceresult"
-        f"?hd={date8}&jcd={code}&rno={race_no}"
+        f"?hd={race_date.strftime('%Y%m%d')}&jcd={code}&rno={race_no}"
     )
     try:
-        parsed = parse_historical_result(html_to_text(fetch_text(url, retries=0)))
+        parsed = parse_historical_result(html_to_text(fetch_text(url)))
         if not parsed:
             return False, "結果なし"
-
         con = db()
         con.execute(
             """
             INSERT OR REPLACE INTO historical_results(
               race_date,venue,venue_code,race_no,actual_combo,payout_100,
-              weather,wind_dir,wind_speed,wave_height,winning_method,
               source_url,collected_at
-            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+            ) VALUES(?,?,?,?,?,?,?,?)
             """,
             (
                 race_date.isoformat(),
@@ -517,11 +445,6 @@ def collect_historical_result(
                 race_no,
                 parsed["actual_combo"],
                 parsed["payout_100"],
-                parsed["weather"],
-                parsed["wind_dir"],
-                parsed["wind_speed"],
-                parsed["wave_height"],
-                parsed["winning_method"],
                 url,
                 datetime.now(JST).isoformat(),
             ),
@@ -532,178 +455,177 @@ def collect_historical_result(
         return False, str(exc)
 
 
-def historical_results_df() -> pd.DataFrame:
-    return pd.read_sql_query(
-        "SELECT * FROM historical_results ORDER BY race_date,venue_code,race_no",
-        db(),
-    )
+def historical_results_rows(limit: int = 500) -> list[dict[str, Any]]:
+    rows = db().execute(
+        """
+        SELECT race_date,venue,race_no,actual_combo,payout_100
+        FROM historical_results
+        ORDER BY race_date DESC,venue_code,race_no
+        LIMIT ?
+        """,
+        (limit,),
+    ).fetchall()
+    return [dict(row) for row in rows]
 
 
-# =========================================================
-# 学習・検証
-# =========================================================
-TRAINING_COLUMNS = [
-    "race_date","venue","race_no","combo","odds",
-    "poseidon_prob","umepyon_prob","fallback_prob",
-    "actual_combo","payout_100",
-]
+def training_template_csv() -> bytes:
+    output = StringIO()
+    writer = csv.writer(output)
+    writer.writerow([
+        "race_date","venue","race_no","combo","odds",
+        "poseidon_prob","umepyon_prob","fallback_prob",
+        "actual_combo","payout_100",
+    ])
+    writer.writerow([
+        "2026-07-01","桐生",1,"1-2-3",12.4,
+        11.2,9.8,0,"1-2-3",1240,
+    ])
+    writer.writerow([
+        "2026-07-01","桐生",1,"1-3-2",18.6,
+        8.1,10.5,0,"1-2-3",1240,
+    ])
+    return output.getvalue().encode("utf-8-sig")
 
 
-def normalize_training_df(frame: pd.DataFrame) -> pd.DataFrame:
-    missing = [column for column in TRAINING_COLUMNS if column not in frame.columns]
-    if missing:
+def parse_training_csv(uploaded_file: Any) -> list[dict[str, Any]]:
+    text = uploaded_file.getvalue().decode("utf-8-sig", errors="replace")
+    reader = csv.DictReader(StringIO(text))
+    required = {
+        "race_date","venue","race_no","combo","odds",
+        "poseidon_prob","umepyon_prob","fallback_prob",
+        "actual_combo","payout_100",
+    }
+    if not reader.fieldnames or not required.issubset(set(reader.fieldnames)):
+        missing = sorted(required - set(reader.fieldnames or []))
         raise ValueError("不足列: " + ", ".join(missing))
 
-    df = frame[TRAINING_COLUMNS].copy()
-    for column in (
-        "race_no","odds","poseidon_prob","umepyon_prob",
-        "fallback_prob","payout_100",
-    ):
-        df[column] = pd.to_numeric(df[column], errors="coerce").fillna(0)
-
-    for column in ("race_date","venue","combo","actual_combo"):
-        df[column] = df[column].astype(str).str.strip()
-
-    df = df[df["odds"] > 0].copy()
-    df["race_id"] = (
-        df["race_date"]
-        + "|"
-        + df["venue"]
-        + "|"
-        + df["race_no"].astype(int).astype(str)
-    )
-    return df
-
-
-def candidate_probability(row: pd.Series, poseidon_weight: float) -> float:
-    pose = float(row.get("poseidon_prob", 0) or 0)
-    ume = float(row.get("umepyon_prob", 0) or 0)
-    fallback = float(row.get("fallback_prob", 0) or 0)
-
-    if pose > 0 and ume > 0:
-        return pose * poseidon_weight + ume * (1 - poseidon_weight)
-    if pose > 0:
-        return pose
-    if ume > 0:
-        return ume
-    return fallback
+    rows: list[dict[str, Any]] = []
+    for raw in reader:
+        try:
+            rows.append({
+                "race_date":str(raw["race_date"]).strip(),
+                "venue":str(raw["venue"]).strip(),
+                "race_no":int(float(raw["race_no"] or 0)),
+                "combo":str(raw["combo"]).strip(),
+                "odds":float(raw["odds"] or 0),
+                "poseidon_prob":float(raw["poseidon_prob"] or 0),
+                "umepyon_prob":float(raw["umepyon_prob"] or 0),
+                "fallback_prob":float(raw["fallback_prob"] or 0),
+                "actual_combo":str(raw["actual_combo"]).strip(),
+                "payout_100":int(float(raw["payout_100"] or 0)),
+            })
+        except Exception:
+            continue
+    return [row for row in rows if row["odds"] > 0]
 
 
-def backtest(
-    df: pd.DataFrame,
+def backtest_rows(
+    rows: list[dict[str, Any]],
     poseidon_weight: float,
     ev_threshold: float,
     max_bets: int,
 ) -> dict[str, Any]:
-    investment = 0
-    returned = 0
-    purchased_races = 0
-    hit_races = 0
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        race_id = f"{row['race_date']}|{row['venue']}|{row['race_no']}"
+        grouped.setdefault(race_id, []).append(row)
 
-    for _, race in df.groupby("race_id", sort=False):
-        work = race.copy()
-        work["model_prob"] = work.apply(
-            lambda row: candidate_probability(row, poseidon_weight),
-            axis=1,
-        )
-        work["ev"] = work["model_prob"] / 100 * work["odds"]
+    investment = returned = purchased = hits = 0
 
-        selected = work[work["ev"] >= ev_threshold].sort_values(
-            ["ev","model_prob"],
-            ascending=False,
-        ).head(max_bets)
+    for race_rows in grouped.values():
+        candidates = []
+        for row in race_rows:
+            pose = row["poseidon_prob"]
+            ume = row["umepyon_prob"]
+            fallback = row["fallback_prob"]
+            if pose > 0 and ume > 0:
+                probability = pose * poseidon_weight + ume * (1 - poseidon_weight)
+            else:
+                probability = pose or ume or fallback
+            ev = probability / 100 * row["odds"]
+            candidates.append({**row, "probability":probability, "ev":ev})
 
-        if selected.empty:
+        selected = sorted(
+            [row for row in candidates if row["ev"] >= ev_threshold],
+            key=lambda row: (row["ev"], row["probability"]),
+            reverse=True,
+        )[:max_bets]
+
+        if not selected:
             continue
 
-        purchased_races += 1
-        race_investment = len(selected) * 100
-        investment += race_investment
+        purchased += 1
+        investment += len(selected) * 100
+        actual_combo = race_rows[0]["actual_combo"]
+        payout_100 = race_rows[0]["payout_100"]
 
-        actual_combo = str(work["actual_combo"].iloc[0])
-        payout_100 = int(work["payout_100"].iloc[0])
-        hit = actual_combo in set(selected["combo"])
-
-        if hit:
-            hit_races += 1
+        if any(row["combo"] == actual_combo for row in selected):
+            hits += 1
             returned += payout_100
 
     return {
-        "investment":investment,
-        "returned":returned,
-        "profit":returned - investment,
-        "roi":returned / investment * 100 if investment else 0,
-        "purchased_races":purchased_races,
-        "hit_races":hit_races,
-        "hit_rate":hit_races / purchased_races * 100 if purchased_races else 0,
+        "購入レース":purchased,
+        "的中率":round(hits / purchased * 100, 1) if purchased else 0,
+        "投資":investment,
+        "回収":returned,
+        "収支":returned - investment,
+        "回収率":round(returned / investment * 100, 1) if investment else 0,
     }
 
 
-def optimize_training(df: pd.DataFrame) -> tuple[dict[str, Any], pd.DataFrame]:
-    results: list[dict[str, Any]] = []
+def optimize_training(rows: list[dict[str, Any]]) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    ranking: list[dict[str, Any]] = []
 
-    for weight_step in range(21):
+    for weight_step in range(0, 21, 2):
         poseidon_weight = weight_step / 20
-        for ev_step in range(80, 161, 5):
+        for ev_step in range(90, 151, 10):
             ev_threshold = ev_step / 100
-            for max_bets in (3, 4, 5, 6, 8):
-                report = backtest(
-                    df,
+            for max_bets in (3, 5, 8):
+                report = backtest_rows(
+                    rows,
                     poseidon_weight,
                     ev_threshold,
                     max_bets,
                 )
-                if report["purchased_races"] < 10:
+                if report["購入レース"] < 10:
                     continue
-                results.append(
-                    {
-                        "poseidon_weight":poseidon_weight,
-                        "umepyon_weight":1 - poseidon_weight,
-                        "ev_threshold":ev_threshold,
-                        "max_bets":max_bets,
-                        "profit":report["profit"],
-                        "roi":report["roi"],
-                        "purchased_races":report["purchased_races"],
-                        "hit_rate":report["hit_rate"],
-                    }
-                )
+                ranking.append({
+                    "ポセイドン比重":poseidon_weight,
+                    "梅吉AI比重":1 - poseidon_weight,
+                    "期待値基準":ev_threshold,
+                    "最大点数":max_bets,
+                    **report,
+                })
 
-    if not results:
+    if not ranking:
         raise ValueError("学習可能な購入レースが10件未満です。")
 
-    ranking = pd.DataFrame(results).sort_values(
-        ["profit","roi","purchased_races"],
-        ascending=False,
-    ).reset_index(drop=True)
-
-    best = ranking.iloc[0].to_dict()
-    save_model_config(
-        {
-            **best,
-            "updated_at":datetime.now(JST).isoformat(),
-            "training_rows":len(df),
-            "training_races":df["race_id"].nunique(),
-            "backtest_roi":best["roi"],
-            "backtest_profit":best["profit"],
-        }
+    ranking.sort(
+        key=lambda row: (row["収支"], row["回収率"], row["購入レース"]),
+        reverse=True,
     )
-    return best, ranking
+    best = ranking[0]
+
+    save_model_config({
+        "poseidon_weight":best["ポセイドン比重"],
+        "umepyon_weight":best["梅吉AI比重"],
+        "ev_threshold":best["期待値基準"],
+        "max_bets":best["最大点数"],
+        "updated_at":datetime.now(JST).isoformat(),
+        "backtest_roi":best["回収率"],
+        "backtest_profit":best["収支"],
+    })
+    return best, ranking[:30]
 
 
-# =========================================================
-# UI
-# =========================================================
 init_db()
-
 st.set_page_config(page_title=APP_NAME, layout="wide")
-st.title("🚤 WDJ ボートレースAI Web版 V21")
+st.title("🚤 WDJ ボートレースAI Web版 V22 Stable")
 st.caption(
-    "GitHubのWebアップロードで壊れにくい1ファイル構成。"
-    "予想・過去収集・学習をこのapp.pyだけで動かします。"
+    "Segmentation fault対策としてpandas・BeautifulSoupを使わない軽量版です。"
 )
 
 tabs = st.tabs(["予想", "過去5年収集", "学習・検証", "データ確認"])
-
 
 with tabs[0]:
     c1, c2, c3 = st.columns(3)
@@ -711,14 +633,8 @@ with tabs[0]:
     venue = c2.selectbox("場", list(VENUES))
     race_no = c3.selectbox("R", range(1, 13))
 
-    run_prediction = st.button(
-        "3サイト取得 → 予想を表示",
-        type="primary",
-        use_container_width=True,
-    )
-
-    if run_prediction:
-        with st.spinner("公式・梅吉AI・ポセイドンを取得中…"):
+    if st.button("3サイト取得 → 予想を表示", type="primary", use_container_width=True):
+        with st.spinner("3サイトを取得中…"):
             sources = fetch_live_sources(
                 race_date.strftime("%Y%m%d"),
                 race_date.strftime("%Y-%m-%d"),
@@ -727,13 +643,13 @@ with tabs[0]:
             )
             prediction = build_prediction(sources)
 
-        st.session_state["v21_prediction"] = {
+        st.session_state["v22_result"] = {
             "selection":f"{race_date}-{venue}-{race_no}",
             "sources":sources,
             "prediction":prediction,
         }
 
-    result = st.session_state.get("v21_prediction")
+    result = st.session_state.get("v22_result")
     if result and result["selection"] == f"{race_date}-{venue}-{race_no}":
         prediction = result["prediction"]
         sources = result["sources"]
@@ -746,29 +662,7 @@ with tabs[0]:
         m4.metric("参考期待値", prediction["avg_ev"])
 
         st.subheader("🎯 買い目")
-        table = pd.DataFrame(prediction["bets"]).rename(
-            columns={
-                "rank":"順位",
-                "combo":"買い目",
-                "odds":"オッズ",
-                "amount":"購入額",
-                "return":"的中時払戻",
-                "profit":"純利益",
-                "model_prob":"推定確率",
-                "ev":"期待値",
-                "poseidon_prob":"ポセイドン確率",
-                "umepyon_prob":"梅吉確率",
-            }
-        )
-        columns = [
-            "順位","買い目","オッズ","購入額","的中時払戻","純利益",
-            "推定確率","期待値","ポセイドン確率","梅吉確率",
-        ]
-        st.dataframe(
-            table[[column for column in columns if column in table.columns]],
-            hide_index=True,
-            use_container_width=True,
-        )
+        st.table(prediction["bets"])
 
         s1, s2, s3 = st.columns(3)
         s1.metric(
@@ -784,32 +678,25 @@ with tabs[0]:
             "OK" if not sources["umepyon_error"] else "エラー",
         )
 
-        save_key = f"{race_date}-{venue}-{race_no}"
-        if st.session_state.get("v21_saved_key") != save_key:
+        save_key = result["selection"]
+        if st.session_state.get("v22_saved_key") != save_key:
             try:
-                save_prediction(
-                    {
-                        "race_date":str(race_date),
-                        "venue":venue,
-                        "race_no":race_no,
-                        "action":prediction["action"],
-                        "classification":prediction["classification"],
-                        "confidence":prediction["confidence"],
-                        "expected_value":prediction["avg_ev"],
-                        "bets":prediction["bets"],
-                        "sources":sources["urls"],
-                    }
-                )
-                st.session_state["v21_saved_key"] = save_key
+                save_prediction({
+                    "race_date":str(race_date),
+                    "venue":venue,
+                    "race_no":race_no,
+                    "action":prediction["action"],
+                    "expected_value":prediction["avg_ev"],
+                    "bets":prediction["bets"],
+                })
+                st.session_state["v22_saved_key"] = save_key
             except Exception:
                 pass
     else:
         st.info("開催日・場・Rを選び、予想ボタンを押してください。")
 
-
 with tabs[1]:
     st.header("📚 過去5年公式結果収集")
-
     today = datetime.now(JST).date()
     five_years_ago = today - timedelta(days=365 * 5)
 
@@ -819,103 +706,66 @@ with tabs[1]:
         five_years_ago,
         min_value=five_years_ago,
         max_value=today,
-        key="history_start",
+        key="v22_start",
     )
     end_date = d2.date_input(
         "終了日",
         min(start_date + timedelta(days=1), today),
         min_value=start_date,
         max_value=today,
-        key="history_end",
+        key="v22_end",
     )
 
-    venues = st.multiselect(
-        "収集する場",
-        list(VENUES),
-        default=list(VENUES)[:2],
-    )
+    venues = st.multiselect("収集する場", list(VENUES), default=list(VENUES)[:2])
     race_limit = st.select_slider(
         "1場あたりのレース数",
         options=[1, 3, 6, 12],
         value=12,
     )
 
-    total_requests = (
-        (end_date - start_date).days + 1
-    ) * len(venues) * int(race_limit)
-
+    total_requests = ((end_date - start_date).days + 1) * len(venues) * int(race_limit)
     st.info(f"今回の最大取得数：{total_requests:,}ページ")
 
-    if total_requests > 200:
+    if total_requests > 100:
         st.error(
-            "安全のため200ページを超える収集は実行できません。"
+            "安定運用のため100ページ以下にしてください。"
             "日付・場数・レース数を減らしてください。"
         )
 
-    collect_button = st.button(
+    if st.button(
         "この範囲を収集",
         type="primary",
         use_container_width=True,
-        disabled=(not venues) or total_requests > 200,
-    )
-
-    if collect_button:
+        disabled=(not venues) or total_requests > 100,
+    ):
         progress = st.progress(0)
         status = st.empty()
-        done = 0
-        saved = 0
-        failed = 0
+        done = saved = failed = 0
         current_date = start_date
 
         while current_date <= end_date:
             for venue_name in venues:
-                code = VENUES[venue_name]
-                for race_no_item in range(1, int(race_limit) + 1):
-                    status.write(
-                        f"取得中：{current_date} {venue_name}{race_no_item}R"
-                    )
+                for rno in range(1, int(race_limit) + 1):
+                    status.write(f"取得中：{current_date} {venue_name}{rno}R")
                     ok, message = collect_historical_result(
                         current_date,
                         venue_name,
-                        code,
-                        race_no_item,
+                        VENUES[venue_name],
+                        rno,
                     )
                     done += 1
                     if ok:
                         saved += 1
                     elif message != "結果なし":
                         failed += 1
-                    progress.progress(
-                        min(done / max(total_requests, 1), 1.0)
-                    )
-                    time.sleep(0.08)
+                    progress.progress(min(done / max(total_requests, 1), 1.0))
+                    time.sleep(0.05)
             current_date += timedelta(days=1)
 
-        status.success(
-            f"完了：保存 {saved}レース／通信失敗 {failed}件"
-        )
+        status.success(f"完了：保存 {saved}レース／通信失敗 {failed}件")
 
-    results = historical_results_df()
-    q1, q2, q3 = st.columns(3)
-    q1.metric("保存済みレース", f"{len(results):,}")
-    q2.metric(
-        "保存済み日数",
-        results["race_date"].nunique() if not results.empty else 0,
-    )
-    q3.metric(
-        "保存済み場数",
-        results["venue"].nunique() if not results.empty else 0,
-    )
-
-    if not results.empty:
-        st.download_button(
-            "公式結果CSVをダウンロード",
-            results.to_csv(index=False).encode("utf-8-sig"),
-            file_name="official_results.csv",
-            mime="text/csv",
-            use_container_width=True,
-        )
-
+    saved_count = db().execute("SELECT COUNT(*) FROM historical_results").fetchone()[0]
+    st.metric("保存済みレース", f"{saved_count:,}")
 
 with tabs[2]:
     st.header("🧠 学習・バックテスト")
@@ -927,38 +777,9 @@ with tabs[2]:
     a3.metric("期待値基準", f"{float(config['ev_threshold']):.2f}")
     a4.metric("最大点数", int(config["max_bets"]))
 
-    sample = pd.DataFrame(
-        [
-            {
-                "race_date":"2026-07-01",
-                "venue":"桐生",
-                "race_no":1,
-                "combo":"1-2-3",
-                "odds":12.4,
-                "poseidon_prob":11.2,
-                "umepyon_prob":9.8,
-                "fallback_prob":0,
-                "actual_combo":"1-2-3",
-                "payout_100":1240,
-            },
-            {
-                "race_date":"2026-07-01",
-                "venue":"桐生",
-                "race_no":1,
-                "combo":"1-3-2",
-                "odds":18.6,
-                "poseidon_prob":8.1,
-                "umepyon_prob":10.5,
-                "fallback_prob":0,
-                "actual_combo":"1-2-3",
-                "payout_100":1240,
-            },
-        ]
-    )
-
     st.download_button(
         "学習CSVテンプレート",
-        sample.to_csv(index=False).encode("utf-8-sig"),
+        training_template_csv(),
         file_name="training_template.csv",
         mime="text/csv",
         use_container_width=True,
@@ -968,63 +789,44 @@ with tabs[2]:
 
     if uploaded is not None:
         try:
-            training_df = normalize_training_df(pd.read_csv(uploaded))
-            st.success(
-                f"読込：{len(training_df):,}行／"
-                f"{training_df['race_id'].nunique():,}レース"
-            )
+            training_rows = parse_training_csv(uploaded)
+            race_count = len({
+                f"{row['race_date']}|{row['venue']}|{row['race_no']}"
+                for row in training_rows
+            })
+            st.success(f"読込：{len(training_rows):,}行／{race_count:,}レース")
 
             b1, b2 = st.columns(2)
-
             if b1.button("現在設定で検証", use_container_width=True):
-                st.session_state["v21_backtest"] = backtest(
-                    training_df,
+                st.session_state["v22_backtest"] = backtest_rows(
+                    training_rows,
                     float(config["poseidon_weight"]),
                     float(config["ev_threshold"]),
                     int(config["max_bets"]),
                 )
 
-            if b2.button(
-                "自動最適化",
-                type="primary",
-                use_container_width=True,
-            ):
+            if b2.button("自動最適化", type="primary", use_container_width=True):
                 with st.spinner("最適条件を検証中…"):
-                    best, ranking = optimize_training(training_df)
-                st.session_state["v21_best"] = best
-                st.session_state["v21_ranking"] = ranking.head(30)
+                    best, ranking = optimize_training(training_rows)
+                st.session_state["v22_best"] = best
+                st.session_state["v22_ranking"] = ranking
                 st.success("学習設定を保存しました。")
-
         except Exception as exc:
             st.error(f"CSVエラー：{exc}")
 
-    if "v21_backtest" in st.session_state:
-        report = st.session_state["v21_backtest"]
-        r1, r2, r3, r4 = st.columns(4)
-        r1.metric("購入レース", report["purchased_races"])
-        r2.metric("的中率", f"{report['hit_rate']:.1f}%")
-        r3.metric("収支", f"{report['profit']:,}円")
-        r4.metric("回収率", f"{report['roi']:.1f}%")
+    if "v22_backtest" in st.session_state:
+        st.subheader("検証結果")
+        st.json(st.session_state["v22_backtest"])
 
-    if "v21_best" in st.session_state:
+    if "v22_best" in st.session_state:
         st.subheader("最適設定")
-        st.json(st.session_state["v21_best"])
-        st.dataframe(
-            st.session_state["v21_ranking"],
-            hide_index=True,
-            use_container_width=True,
-        )
-
+        st.json(st.session_state["v22_best"])
+        st.table(st.session_state["v22_ranking"])
 
 with tabs[3]:
     st.header("📊 データ確認")
-    results = historical_results_df()
-
-    if results.empty:
-        st.info("過去結果はまだありません。")
+    rows = historical_results_rows()
+    if rows:
+        st.table(rows)
     else:
-        st.dataframe(
-            results.tail(500),
-            hide_index=True,
-            use_container_width=True,
-        )
+        st.info("過去結果はまだありません。")
