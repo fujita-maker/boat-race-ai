@@ -19,7 +19,7 @@ import requests
 import streamlit as st
 
 
-APP_NAME = "WDJ Boat Race AI Web版 V30.3 VERIFIED"
+APP_NAME = "WDJ Boat Race AI Web版 V30.4 VERIFIED"
 JST = timezone(timedelta(hours=9))
 PAYBACK_RATE = 0.75  # 3連単の平均払戻率(控除率25%). edge計測の基準に使用.
 
@@ -48,9 +48,9 @@ HEADERS = {
     ),
     "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
 }
-CONNECT_TIMEOUT = 4
-READ_TIMEOUT = 7
-MAX_RESPONSE_BYTES = 900_000
+CONNECT_TIMEOUT = 8
+READ_TIMEOUT = 20  # boatrace.jpは応答が遅く7秒では読み取りタイムアウトしていたため延長
+MAX_RESPONSE_BYTES = 1_400_000
 
 
 def db() -> sqlite3.Connection:
@@ -233,11 +233,17 @@ def live_urls(date8: str, date_iso: str, code: str, race_no: int) -> dict[str, s
     }
 
 
-def safe_fetch(url: str) -> tuple[str, str | None]:
-    try:
-        return html_to_text(fetch_text(url)), None
-    except Exception as exc:
-        return "", str(exc)
+def safe_fetch(url: str, retries: int = 1) -> tuple[str, str | None]:
+    """取得してテキスト化。タイムアウト等の一時的失敗に備え1回だけ再試行する。"""
+    last_error: str | None = None
+    for attempt in range(retries + 1):
+        try:
+            return html_to_text(fetch_text(url)), None
+        except Exception as exc:
+            last_error = str(exc)
+            if attempt < retries:
+                time.sleep(1.0)
+    return "", last_error
 
 
 def fetch_live_sources(date8: str, date_iso: str, code: str, race_no: int) -> dict[str, Any]:
@@ -830,9 +836,9 @@ def replay_staking(joined: list[dict[str, Any]], init: float = 300000.0) -> list
 
 init_db()
 st.set_page_config(page_title=APP_NAME, layout="wide")
-st.title("🚤 WDJ ボートレースAI Web版 V30.3 VERIFIED")
+st.title("🚤 WDJ ボートレースAI Web版 V30.4 VERIFIED")
 st.caption(
-    "BUILD: V30.3-VERIFIED-20260803｜HTTP取得＋予想の永続記録・実データでのedge/資金戦略検証。"
+    "BUILD: V30.4-VERIFIED-20260803｜公式取得のタイムアウト延長＋再試行。予想の永続記録・実データでのedge/資金戦略検証。"
 )
 
 tabs = st.tabs(["予想", "過去5年収集", "学習・検証", "データ確認", "収支・edge検証"])
