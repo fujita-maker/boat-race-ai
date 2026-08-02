@@ -31,7 +31,7 @@ VENUES = {
     "下関":"19","若松":"20","芦屋":"21","福岡":"22","唐津":"23","大村":"24"
 }
 
-st.set_page_config(page_title="WDJ Boat Race AI v11", layout="wide")
+st.set_page_config(page_title="WDJ Boat Race AI v13", layout="wide")
 
 
 # ---------- DB ----------
@@ -62,8 +62,233 @@ def db() -> sqlite3.Connection:
       season TEXT,
       wind_dir TEXT
     )""")
+    con.execute("""
+    CREATE TABLE IF NOT EXISTS model_config(
+      id INTEGER PRIMARY KEY CHECK(id=1),
+      poseidon_weight REAL DEFAULT 0.72,
+      umepyon_weight REAL DEFAULT 0.28,
+      ev_threshold REAL DEFAULT 1.10,
+      max_bets INTEGER DEFAULT 8,
+      updated_at TEXT,
+      training_rows INTEGER DEFAULT 0,
+      training_races INTEGER DEFAULT 0,
+      backtest_roi REAL DEFAULT 0,
+      backtest_profit INTEGER DEFAULT 0
+    )""")
+    con.execute("""
+    INSERT OR IGNORE INTO model_config(
+      id,poseidon_weight,umepyon_weight,ev_threshold,max_bets,updated_at
+    ) VALUES(1,0.72,0.28,1.10,8,'初期値')
+    """)
+    con.execute("""
+    CREATE TABLE IF NOT EXISTS historical_candidates(
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      race_date TEXT,
+      venue TEXT,
+      race_no INTEGER,
+      combo TEXT,
+      odds REAL,
+      poseidon_prob REAL,
+      umepyon_prob REAL,
+      fallback_prob REAL,
+      actual_combo TEXT,
+      payout_100 INTEGER,
+      imported_at TEXT
+    )""")
     con.commit()
     return con
+
+
+
+# ---------- Learning configuration ----------
+def get_model_config() -> dict[str, Any]:
+    con = db()
+    row = con.execute("""
+      SELECT poseidon_weight,umepyon_weight,ev_threshold,max_bets,
+             updated_at,training_rows,training_races,backtest_roi,backtest_profit
+      FROM model_config WHERE id=1
+    """).fetchone()
+    if not row:
+        return {
+            "poseidon_weight":0.72, "umepyon_weight":0.28,
+            "ev_threshold":1.10, "max_bets":8, "updated_at":"初期値",
+            "training_rows":0, "training_races":0,
+            "backtest_roi":0.0, "backtest_profit":0,
+        }
+    keys = [
+        "poseidon_weight","umepyon_weight","ev_threshold","max_bets",
+        "updated_at","training_rows","training_races","backtest_roi","backtest_profit",
+    ]
+    return dict(zip(keys, row))
+
+
+def save_model_config(config: dict[str, Any]) -> None:
+    con = db()
+    con.execute("""
+      UPDATE model_config SET
+        poseidon_weight=?,umepyon_weight=?,ev_threshold=?,max_bets=?,
+        updated_at=?,training_rows=?,training_races=?,backtest_roi=?,backtest_profit=?
+      WHERE id=1
+    """, (
+        float(config["poseidon_weight"]),
+        float(config["umepyon_weight"]),
+        float(config["ev_threshold"]),
+        int(config["max_bets"]),
+        str(config["updated_at"]),
+        int(config["training_rows"]),
+        int(config["training_races"]),
+        float(config["backtest_roi"]),
+        int(config["backtest_profit"]),
+    ))
+    con.commit()
+
+
+TRAINING_COLUMNS = [
+    "race_date","venue","race_no","combo","odds",
+    "poseidon_prob","umepyon_prob","fallback_prob",
+    "actual_combo","payout_100",
+]
+
+
+def normalize_training_df(frame: pd.DataFrame) -> pd.DataFrame:
+    df = frame.copy()
+    missing = [c for c in TRAINING_COLUMNS if c not in df.columns]
+    if missing:
+        raise ValueError("不足列: " + ", ".join(missing))
+
+    df = df[TRAINING_COLUMNS].copy()
+    df["race_date"] = df["race_date"].astype(str)
+    df["venue"] = df["venue"].astype(str)
+    df["combo"] = df["combo"].astype(str).str.strip()
+    df["actual_combo"] = df["actual_combo"].astype(str).str.strip()
+
+    for col in [
+        "race_no","odds","poseidon_prob","umepyon_prob",
+        "fallback_prob","payout_100",
+    ]:
+        df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
+
+    df = df[
+        df["combo"].str.match(r"^[1-6]-[1-6]-[1-6]$")
+        & df["actual_combo"].str.match(r"^[1-6]-[1-6]-[1-6]$")
+    ].copy()
+    df = df[df["odds"] > 0].copy()
+    df["race_id"] = (
+        df["race_date"] + "|" + df["venue"] + "|" + df["race_no"].astype(int).astype(str)
+    )
+    return df
+
+
+def candidate_probability(row: pd.Series, poseidon_weight: float) -> float:
+    pose = float(row.get("poseidon_prob", 0) or 0)
+    ume = float(row.get("umepyon_prob", 0) or 0)
+    fallback = float(row.get("fallback_prob", 0) or 0)
+
+    if pose > 0 and ume > 0:
+        return pose * poseidon_weight + ume * (1 - poseidon_weight)
+    if pose > 0:
+        return pose
+    if ume > 0:
+        return ume
+    return fallback
+
+
+def backtest_training(
+    df: pd.DataFrame,
+    poseidon_weight: float,
+    ev_threshold: float,
+    max_bets: int,
+) -> dict[str, Any]:
+    investment = 0
+    returned = 0
+    purchased_races = 0
+    hit_races = 0
+    all_rows: list[dict[str, Any]] = []
+
+    for race_id, race in df.groupby("race_id", sort=False):
+        work = race.copy()
+        work["model_prob"] = work.apply(
+            lambda row: candidate_probability(row, poseidon_weight), axis=1
+        )
+        work["ev"] = work["model_prob"] / 100 * work["odds"]
+        selected = work[work["ev"] >= ev_threshold].sort_values(
+            ["ev","model_prob"], ascending=False
+        ).head(max_bets)
+
+        if selected.empty:
+            continue
+
+        purchased_races += 1
+        race_investment = len(selected) * 100
+        investment += race_investment
+        actual_combo = str(work["actual_combo"].iloc[0])
+        payout_100 = int(work["payout_100"].iloc[0])
+
+        hit = actual_combo in set(selected["combo"])
+        race_return = payout_100 if hit else 0
+        if hit:
+            hit_races += 1
+        returned += race_return
+
+        all_rows.append({
+            "race_id":race_id,
+            "購入点数":len(selected),
+            "投資":race_investment,
+            "的中":1 if hit else 0,
+            "回収":race_return,
+            "収支":race_return-race_investment,
+        })
+
+    profit = returned - investment
+    roi = returned / investment * 100 if investment else 0
+    hit_rate = hit_races / purchased_races * 100 if purchased_races else 0
+
+    return {
+        "investment":investment,
+        "returned":returned,
+        "profit":profit,
+        "roi":roi,
+        "purchased_races":purchased_races,
+        "hit_races":hit_races,
+        "hit_rate":hit_rate,
+        "details":pd.DataFrame(all_rows),
+    }
+
+
+def optimize_training(df: pd.DataFrame) -> tuple[dict[str, Any], pd.DataFrame]:
+    results: list[dict[str, Any]] = []
+
+    for weight_step in range(0, 21):
+        poseidon_weight = weight_step / 20
+        for ev_step in range(80, 161, 5):
+            ev_threshold = ev_step / 100
+            for max_bets in (3, 4, 5, 6, 8):
+                report = backtest_training(
+                    df, poseidon_weight, ev_threshold, max_bets
+                )
+                if report["purchased_races"] < 10:
+                    continue
+                results.append({
+                    "poseidon_weight":poseidon_weight,
+                    "umepyon_weight":1-poseidon_weight,
+                    "ev_threshold":ev_threshold,
+                    "max_bets":max_bets,
+                    "investment":report["investment"],
+                    "returned":report["returned"],
+                    "profit":report["profit"],
+                    "roi":report["roi"],
+                    "purchased_races":report["purchased_races"],
+                    "hit_rate":report["hit_rate"],
+                })
+
+    if not results:
+        raise ValueError("学習可能な購入レースが10件未満です。データを増やしてください。")
+
+    result_df = pd.DataFrame(results)
+    result_df = result_df.sort_values(
+        ["profit","roi","purchased_races"], ascending=False
+    ).reset_index(drop=True)
+    return result_df.iloc[0].to_dict(), result_df
 
 
 # ---------- HTTP ----------
@@ -402,8 +627,12 @@ def build_prediction(
         fallback_prob = parse_float(row.get("fallback_prob"))
 
         available = [p for p in (pose_prob, ume_prob) if p > 0]
+        model_config = get_model_config()
         if len(available) == 2:
-            model_prob = pose_prob * 0.72 + ume_prob * 0.28
+            model_prob = (
+                pose_prob * float(model_config["poseidon_weight"])
+                + ume_prob * float(model_config["umepyon_weight"])
+            )
         elif len(available) == 1:
             model_prob = available[0]
         else:
@@ -459,7 +688,8 @@ def build_prediction(
         and meta["exhibition_st_count"] >= 6
     )
     odds_count = sum(r["odds"] > 0 for r in rows)
-    ev_rows = [r for r in rows if r["odds"] > 0 and r["ev"] >= 1.10]
+    model_config = get_model_config()
+    ev_rows = [r for r in rows if r["odds"] > 0 and r["ev"] >= float(model_config["ev_threshold"])]
 
     # 最新WDJ115-v2
     if not official_ok:
@@ -483,7 +713,7 @@ def build_prediction(
 
     # 予想は毎回表示。購入は条件適合時だけ。
     if eligible:
-        selected = sorted(ev_rows, key=lambda r:(r["ev"], r["model_prob"]), reverse=True)[:8]
+        selected = sorted(ev_rows, key=lambda r:(r["ev"], r["model_prob"]), reverse=True)[:int(model_config["max_bets"])]
         if len(selected) < 6:
             selected = rows[:8]
             eligible = False
@@ -631,14 +861,14 @@ def season_name(month: int) -> str:
 
 
 # ---------- UI ----------
-st.title("🚤 WDJ ボートレースAI Web版 v11")
+st.title("🚤 WDJ ボートレースAI Web版 v13")
 st.caption(
     "開催日・場・Rの選択時に公式・梅吉AI・ポセイドンを自動取得し、"
     "WDJ115-v2条件に適合したレースだけ5,000円で仮想購入します。"
 )
-st.info("V11自動取得版：開催日・場・Rを選ぶと、公式・梅吉AI・ポセイドンを自動取得して最初から買い目を表示します。")
+st.info("V13学習版：3サイト予想に加え、過去データで梅吉AI・ポセイドンの重みと購入条件を最適化します。")
 
-tabs = st.tabs(["予想", "締切3分前監視", "成績ダッシュボード", "結果登録"])
+tabs = st.tabs(["予想", "締切3分前監視", "過去学習", "成績ダッシュボード", "結果登録"])
 
 with tabs[0]:
     c1, c2, c3 = st.columns(3)
@@ -763,6 +993,14 @@ with tabs[0]:
     c.metric("自信度", star_text)
     d.metric("参考期待値", calc.get("avg_ev", 0))
 
+    active_model = get_model_config()
+    st.caption(
+        f"学習設定：ポセイドン {active_model['poseidon_weight']:.0%}／"
+        f"梅吉AI {active_model['umepyon_weight']:.0%}／"
+        f"期待値基準 {active_model['ev_threshold']:.2f}／"
+        f"最大 {int(active_model['max_bets'])}点"
+    )
+
     st.subheader("🎯 3サイト反映後の買い目")
     compact_rows = []
     for row in calc["predictions"][:8]:
@@ -846,6 +1084,133 @@ with tabs[1]:
         st.rerun()
 
 with tabs[2]:
+    st.header("🧠 過去レース学習")
+    st.write(
+        "1レースにつき複数の買い目候補をCSVで登録し、"
+        "ポセイドンと梅吉AIの比重、期待値基準、購入点数を自動最適化します。"
+    )
+
+    current = get_model_config()
+    c1,c2,c3,c4 = st.columns(4)
+    c1.metric("ポセイドン比重", f"{current['poseidon_weight']:.0%}")
+    c2.metric("梅吉AI比重", f"{current['umepyon_weight']:.0%}")
+    c3.metric("購入期待値基準", f"{current['ev_threshold']:.2f}")
+    c4.metric("最大購入点数", int(current["max_bets"]))
+    st.caption(
+        f"最終更新：{current['updated_at']}／学習レース {int(current['training_races'])}件／"
+        f"検証回収率 {float(current['backtest_roi']):.1f}%"
+    )
+
+    sample = pd.DataFrame([
+        {
+            "race_date":"2026-07-01","venue":"桐生","race_no":1,
+            "combo":"1-2-3","odds":12.4,
+            "poseidon_prob":11.2,"umepyon_prob":9.8,"fallback_prob":0,
+            "actual_combo":"1-2-3","payout_100":1240,
+        },
+        {
+            "race_date":"2026-07-01","venue":"桐生","race_no":1,
+            "combo":"1-3-2","odds":18.6,
+            "poseidon_prob":8.1,"umepyon_prob":10.5,"fallback_prob":0,
+            "actual_combo":"1-2-3","payout_100":1240,
+        },
+    ])
+    st.download_button(
+        "学習CSVテンプレートをダウンロード",
+        sample.to_csv(index=False).encode("utf-8-sig"),
+        file_name="boat_race_training_template.csv",
+        mime="text/csv",
+        use_container_width=True,
+    )
+
+    uploaded = st.file_uploader(
+        "過去データCSVを選択",
+        type=["csv"],
+        help="同じレースの候補買い目を複数行で登録してください。",
+    )
+
+    training_df = None
+    if uploaded is not None:
+        try:
+            raw_df = pd.read_csv(uploaded)
+            training_df = normalize_training_df(raw_df)
+            st.success(
+                f"読込成功：候補 {len(training_df):,}行／"
+                f"レース {training_df['race_id'].nunique():,}件"
+            )
+            st.dataframe(training_df.head(30), hide_index=True, use_container_width=True)
+        except Exception as exc:
+            st.error(f"CSVを読み込めません：{exc}")
+
+    if training_df is not None and not training_df.empty:
+        b1,b2 = st.columns(2)
+
+        if b1.button("現在設定で過去検証", use_container_width=True):
+            report = backtest_training(
+                training_df,
+                float(current["poseidon_weight"]),
+                float(current["ev_threshold"]),
+                int(current["max_bets"]),
+            )
+            st.session_state["v13_backtest"] = report
+
+        if b2.button("過去データから自動学習", type="primary", use_container_width=True):
+            with st.spinner("重み・期待値基準・購入点数を総当たりで検証中…"):
+                try:
+                    best, ranking = optimize_training(training_df)
+                    config = {
+                        **best,
+                        "updated_at":datetime.now(JST).isoformat(),
+                        "training_rows":len(training_df),
+                        "training_races":training_df["race_id"].nunique(),
+                        "backtest_roi":best["roi"],
+                        "backtest_profit":best["profit"],
+                    }
+                    save_model_config(config)
+                    st.session_state["v13_best"] = best
+                    st.session_state["v13_ranking"] = ranking.head(30)
+                    st.success("学習結果を保存し、今後の予想へ反映しました。")
+                except Exception as exc:
+                    st.error(f"学習できません：{exc}")
+
+    if "v13_backtest" in st.session_state:
+        report = st.session_state["v13_backtest"]
+        st.subheader("現在設定の検証結果")
+        r1,r2,r3,r4 = st.columns(4)
+        r1.metric("購入レース", report["purchased_races"])
+        r2.metric("的中率", f"{report['hit_rate']:.1f}%")
+        r3.metric("収支", f"{report['profit']:,}円")
+        r4.metric("回収率", f"{report['roi']:.1f}%")
+        if not report["details"].empty:
+            st.dataframe(report["details"], hide_index=True, use_container_width=True)
+
+    if "v13_best" in st.session_state:
+        best = st.session_state["v13_best"]
+        st.subheader("最適化された設定")
+        x1,x2,x3,x4 = st.columns(4)
+        x1.metric("ポセイドン比重", f"{best['poseidon_weight']:.0%}")
+        x2.metric("梅吉AI比重", f"{best['umepyon_weight']:.0%}")
+        x3.metric("期待値基準", f"{best['ev_threshold']:.2f}")
+        x4.metric("最大購入点数", int(best["max_bets"]))
+        y1,y2,y3 = st.columns(3)
+        y1.metric("検証収支", f"{int(best['profit']):,}円")
+        y2.metric("検証回収率", f"{best['roi']:.1f}%")
+        y3.metric("購入レース", int(best["purchased_races"]))
+
+        st.subheader("上位設定30件")
+        st.dataframe(
+            st.session_state["v13_ranking"],
+            hide_index=True,
+            use_container_width=True,
+        )
+
+    st.warning(
+        "最初は最低100レース、できれば1,000レース以上で学習してください。"
+        "同じ期間だけで最適化すると過学習しやすいため、後半期間で別検証するのが安全です。"
+    )
+
+
+with tabs[3]:
     con = db()
     history = pd.read_sql_query("SELECT * FROM predictions ORDER BY id DESC", con)
     if history.empty:
@@ -889,7 +1254,7 @@ with tabs[2]:
             hide_index=True, use_container_width=True
         )
 
-with tabs[3]:
+with tabs[4]:
     con = db()
     history = pd.read_sql_query("SELECT * FROM predictions ORDER BY id DESC", con)
     if history.empty:
