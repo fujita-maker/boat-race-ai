@@ -1,6 +1,7 @@
 services:
   - type: web
-    name: wdj-boat-race-ai
+    name: boat-race-ai-v20
     runtime: docker
     plan: starter
     autoDeploy: true
+    healthCheckPath: /
