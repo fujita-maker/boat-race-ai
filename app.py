@@ -16,6 +16,8 @@ from typing import Any
 
 import requests
 import streamlit as st
+from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+from playwright.sync_api import sync_playwright
 
 
 APP_NAME = "WDJ Boat Race AI Web版 V22 Stable"
@@ -186,6 +188,77 @@ def html_to_text(raw_html: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
+
+def browser_fetch_pages(urls: dict[str, str]) -> tuple[dict[str, str], list[str]]:
+    """Chromiumで公式ページを表示し、描画後の本文を取得する。"""
+    pages: dict[str, str] = {}
+    errors: list[str] = []
+
+    try:
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(
+                headless=True,
+                args=[
+                    "--disable-dev-shm-usage",
+                    "--disable-gpu",
+                    "--no-sandbox",
+                    "--disable-background-networking",
+                    "--disable-extensions",
+                    "--disable-sync",
+                    "--metrics-recording-only",
+                    "--mute-audio",
+                    "--no-first-run",
+                ],
+            )
+            context = browser.new_context(
+                viewport={"width": 1440, "height": 1100},
+                locale="ja-JP",
+                user_agent=HEADERS["User-Agent"],
+                service_workers="block",
+            )
+
+            def block_heavy(route: Any) -> None:
+                resource_type = route.request.resource_type
+                if resource_type in {"image", "media", "font"}:
+                    route.abort()
+                else:
+                    route.continue_()
+
+            context.route("**/*", block_heavy)
+
+            for key, url in urls.items():
+                page = context.new_page()
+                try:
+                    response = page.goto(
+                        url,
+                        wait_until="domcontentloaded",
+                        timeout=12_000,
+                    )
+                    page.wait_for_timeout(1_500)
+                    status = response.status if response else 0
+                    body_text = page.locator("body").inner_text(timeout=4_000)
+                    pages[key] = re.sub(r"\s+", " ", body_text).strip()
+                    if status >= 400:
+                        errors.append(f"{key}: HTTP {status}")
+                    if not pages[key]:
+                        errors.append(f"{key}: 本文なし")
+                except PlaywrightTimeoutError:
+                    errors.append(f"{key}: Chromiumタイムアウト")
+                    pages[key] = ""
+                except Exception as exc:
+                    errors.append(f"{key}: {exc}")
+                    pages[key] = ""
+                finally:
+                    page.close()
+
+            context.close()
+            browser.close()
+    except Exception as exc:
+        errors.append(f"Chromium起動: {exc}")
+
+    return pages, errors
+
+
 def live_urls(date8: str, date_iso: str, code: str, race_no: int) -> dict[str, str]:
     q = f"rno={race_no}&jcd={code}&hd={date8}"
     base = "https://www.boatrace.jp/owpc/pc/race"
@@ -210,14 +283,13 @@ def safe_fetch(url: str) -> tuple[str, str | None]:
 
 def fetch_live_sources(date8: str, date_iso: str, code: str, race_no: int) -> dict[str, Any]:
     urls = live_urls(date8, date_iso, code, race_no)
-    official: dict[str, str] = {}
-    official_errors: list[str] = []
 
-    for key in ("racelist", "before", "odds"):
-        text, error = safe_fetch(urls[key])
-        official[key] = text
-        if error:
-            official_errors.append(f"{key}: {error}")
+    official_urls = {
+        "racelist":urls["racelist"],
+        "before":urls["before"],
+        "odds":urls["odds"],
+    }
+    official, official_errors = browser_fetch_pages(official_urls)
 
     poseidon, poseidon_error = safe_fetch(urls["poseidon"])
     umepyon, umepyon_error = safe_fetch(urls["umepyon"])
@@ -231,7 +303,6 @@ def fetch_live_sources(date8: str, date_iso: str, code: str, race_no: int) -> di
         "umepyon_error":umepyon_error,
         "urls":urls,
     }
-
 
 def parse_odds(text: str) -> dict[str, float]:
     result: dict[str, float] = {}

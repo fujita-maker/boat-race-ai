@@ -1,21 +1,35 @@
-# WDJ Boat Race AI V22.1 Stable
+# WDJ Boat Race AI V30 Playwright
 
-V22の安定性を維持し、公式オッズが発売前・未公開の場合を
-通信エラーと分けて表示する版です。
+BOAT RACE公式をChromiumで表示してから本文を取得する版です。
 
-## 改善点
+## 取得方式
 
-- 公式ページ取得とオッズ取得を別判定
-- オッズ発売前は「ページ取得済み・オッズ発売前」と表示
-- ポセイドンと梅吉AIは、HTTP取得成功ではなく解析できた予想点数を表示
-- 実際に解析できた情報源だけで自信度を計算
-- 取得エラーの詳細を展開表示
-- オッズ未公開時は期待値を捏造せず0のまま表示
+- BOAT RACE公式：Playwright Chromium
+- ポセイドン：requests
+- 梅吉AI：requests
 
-GitHubへ以下の5ファイルを上書きしてください。
+## 安定化
+
+- 画像・動画・フォントを読み込まない
+- Chromiumは予想ボタンを押した時だけ起動
+- 公式3ページを取得したら必ず終了
+- 12秒のページタイムアウト
+- オッズ未公開と通信失敗を分けて表示
+- オッズが無い場合は期待値を捏造しない
+
+## GitHubへ上書きする5ファイル
 
 - app.py
 - Dockerfile
 - requirements.txt
 - render.yaml
 - README.md
+
+アップロード後、Renderで
+`Manual Deploy → Clear build cache & deploy`
+を実行してください。
+
+## 注意
+
+Chromiumを使うためV22よりメモリ使用量が増えます。
+Render Starterでプロセスが落ちる場合は、公式取得だけを別サービスへ分離する必要があります。
