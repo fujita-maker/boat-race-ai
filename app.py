@@ -31,7 +31,7 @@ VENUES = {
     "下関":"19","若松":"20","芦屋":"21","福岡":"22","唐津":"23","大村":"24"
 }
 
-st.set_page_config(page_title="WDJ Boat Race AI v13", layout="wide")
+st.set_page_config(page_title="WDJ Boat Race AI v14", layout="wide")
 
 
 # ---------- DB ----------
@@ -95,6 +95,41 @@ def db() -> sqlite3.Connection:
       payout_100 INTEGER,
       imported_at TEXT
     )""")
+    con.execute("""
+    CREATE TABLE IF NOT EXISTS historical_results(
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      race_date TEXT,
+      venue TEXT,
+      venue_code TEXT,
+      race_no INTEGER,
+      actual_combo TEXT,
+      payout_100 INTEGER,
+      weather TEXT,
+      wind_dir TEXT,
+      wind_speed REAL,
+      wave_height REAL,
+      winning_method TEXT,
+      source_url TEXT,
+      collected_at TEXT,
+      UNIQUE(race_date,venue_code,race_no)
+    )""")
+    con.execute("""
+    CREATE TABLE IF NOT EXISTS collection_state(
+      id INTEGER PRIMARY KEY CHECK(id=1),
+      next_date TEXT,
+      start_date TEXT,
+      end_date TEXT,
+      selected_venues TEXT,
+      updated_at TEXT,
+      collected_races INTEGER DEFAULT 0,
+      failed_requests INTEGER DEFAULT 0
+    )""")
+    con.execute("""
+    INSERT OR IGNORE INTO collection_state(
+      id,next_date,start_date,end_date,selected_venues,updated_at,
+      collected_races,failed_requests
+    ) VALUES(1,'','','','[]','未開始',0,0)
+    """)
     con.commit()
     return con
 
@@ -289,6 +324,119 @@ def optimize_training(df: pd.DataFrame) -> tuple[dict[str, Any], pd.DataFrame]:
         ["profit","roi","purchased_races"], ascending=False
     ).reset_index(drop=True)
     return result_df.iloc[0].to_dict(), result_df
+
+
+
+# ---------- Historical collection ----------
+def parse_historical_result(text: str) -> dict[str, Any] | None:
+    if not text:
+        return None
+
+    combo_match = re.search(
+        r"3連単\s*([1-6])\s*[-－]\s*([1-6])\s*[-－]\s*([1-6])"
+        r"\s*[¥￥]?\s*([0-9,]+)",
+        text,
+    )
+    if not combo_match:
+        return None
+
+    combo = "-".join(combo_match.group(i) for i in (1,2,3))
+    payout = int(combo_match.group(4).replace(",", ""))
+
+    weather = first_value(text, [r"水面気象情報.*?(晴|曇り|雨|雪|霧)", r"\b(晴|曇り|雨|雪|霧)\b"])
+    wind_speed = parse_float(first_value(text, [r"風速\s*([0-9.]+)\s*m"], "0"))
+    wave_height = parse_float(first_value(text, [r"波高\s*([0-9.]+)\s*cm"], "0"))
+    wind_dir = first_value(text, [r"(北東|北西|南東|南西|北|南|東|西)\s*風"], "取得エラー")
+    winning_method = first_value(
+        text,
+        [r"決まり手\s*(逃げ|差し|まくり|まくり差し|抜き|恵まれ)"],
+        "取得エラー",
+    )
+
+    return {
+        "actual_combo":combo,
+        "payout_100":payout,
+        "weather":weather,
+        "wind_dir":wind_dir,
+        "wind_speed":wind_speed,
+        "wave_height":wave_height,
+        "winning_method":winning_method,
+    }
+
+
+def collect_one_race(date8: str, venue: str, code: str, race_no: int) -> tuple[bool, str]:
+    url = (
+        "https://www.boatrace.jp/owpc/pc/race/raceresult"
+        f"?hd={date8}&jcd={code}&rno={race_no}"
+    )
+    try:
+        html = fetch(url, retries=0)
+        parsed = parse_historical_result(page_text(html))
+        if not parsed:
+            return False, "結果なし"
+
+        con = db()
+        con.execute("""
+          INSERT OR REPLACE INTO historical_results(
+            race_date,venue,venue_code,race_no,actual_combo,payout_100,
+            weather,wind_dir,wind_speed,wave_height,winning_method,
+            source_url,collected_at
+          ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """, (
+            datetime.strptime(date8, "%Y%m%d").date().isoformat(),
+            venue,code,race_no,
+            parsed["actual_combo"],parsed["payout_100"],
+            parsed["weather"],parsed["wind_dir"],
+            parsed["wind_speed"],parsed["wave_height"],
+            parsed["winning_method"],url,datetime.now(JST).isoformat(),
+        ))
+        con.commit()
+        return True, "保存"
+    except Exception as exc:
+        return False, str(exc)
+
+
+def historical_results_df() -> pd.DataFrame:
+    con = db()
+    return pd.read_sql_query(
+        "SELECT * FROM historical_results ORDER BY race_date,venue_code,race_no",
+        con,
+    )
+
+
+def collection_state() -> dict[str, Any]:
+    con = db()
+    row = con.execute("""
+      SELECT next_date,start_date,end_date,selected_venues,updated_at,
+             collected_races,failed_requests
+      FROM collection_state WHERE id=1
+    """).fetchone()
+    keys = [
+        "next_date","start_date","end_date","selected_venues","updated_at",
+        "collected_races","failed_requests",
+    ]
+    return dict(zip(keys, row)) if row else {}
+
+
+def save_collection_state(**kwargs: Any) -> None:
+    current = collection_state()
+    current.update(kwargs)
+    con = db()
+    con.execute("""
+      UPDATE collection_state SET
+        next_date=?,start_date=?,end_date=?,selected_venues=?,updated_at=?,
+        collected_races=?,failed_requests=?
+      WHERE id=1
+    """, (
+        current.get("next_date",""),
+        current.get("start_date",""),
+        current.get("end_date",""),
+        current.get("selected_venues","[]"),
+        current.get("updated_at",datetime.now(JST).isoformat()),
+        int(current.get("collected_races",0)),
+        int(current.get("failed_requests",0)),
+    ))
+    con.commit()
 
 
 # ---------- HTTP ----------
@@ -861,14 +1009,14 @@ def season_name(month: int) -> str:
 
 
 # ---------- UI ----------
-st.title("🚤 WDJ ボートレースAI Web版 v13")
+st.title("🚤 WDJ ボートレースAI Web版 v14")
 st.caption(
     "開催日・場・Rの選択時に公式・梅吉AI・ポセイドンを自動取得し、"
     "WDJ115-v2条件に適合したレースだけ5,000円で仮想購入します。"
 )
-st.info("V13学習版：3サイト予想に加え、過去データで梅吉AI・ポセイドンの重みと購入条件を最適化します。")
+st.info("V14収集版：過去5年の公式結果を日付・場ごとに収集し、途中保存・再開・CSV出力できます。")
 
-tabs = st.tabs(["予想", "締切3分前監視", "過去学習", "成績ダッシュボード", "結果登録"])
+tabs = st.tabs(["予想", "締切3分前監視", "過去収集", "過去学習", "成績ダッシュボード", "結果登録"])
 
 with tabs[0]:
     c1, c2, c3 = st.columns(3)
@@ -1084,6 +1232,148 @@ with tabs[1]:
         st.rerun()
 
 with tabs[2]:
+    st.header("📚 過去5年データ収集")
+    st.write(
+        "BOAT RACE公式の確定結果を日付・場・レース単位で保存します。"
+        "5年分は件数が多いため、一度に全部ではなく小分けで収集し、途中から再開します。"
+    )
+
+    today = datetime.now(JST).date()
+    five_years_ago = today - timedelta(days=365 * 5)
+
+    state = collection_state()
+    default_start = five_years_ago
+    if state.get("next_date"):
+        try:
+            default_start = datetime.fromisoformat(state["next_date"]).date()
+        except Exception:
+            pass
+
+    d1,d2 = st.columns(2)
+    collect_start = d1.date_input(
+        "今回の開始日",
+        default_start,
+        min_value=five_years_ago,
+        max_value=today,
+        key="collect_start",
+    )
+    collect_end = d2.date_input(
+        "今回の終了日",
+        min(collect_start + timedelta(days=2), today),
+        min_value=collect_start,
+        max_value=today,
+        key="collect_end",
+    )
+
+    selected_venues = st.multiselect(
+        "収集する場",
+        list(VENUES),
+        default=list(VENUES)[:4],
+        help="最初は4場程度で動作確認してください。全24場は複数回に分けるのが安全です。",
+    )
+    race_limit = st.select_slider(
+        "1場あたりの収集レース数",
+        options=[1,3,6,12],
+        value=12,
+    )
+
+    day_count = (collect_end - collect_start).days + 1
+    request_estimate = day_count * len(selected_venues) * int(race_limit)
+    st.info(
+        f"今回の予定：{day_count}日 × {len(selected_venues)}場 × "
+        f"{race_limit}R ＝ 最大{request_estimate:,}ページ"
+    )
+
+    if request_estimate > 300:
+        st.warning(
+            "一度の取得数が多いです。Renderで止まりやすいため、"
+            "開始日と終了日を1〜3日、場数を4場程度にしてください。"
+        )
+
+    start_collect = st.button(
+        "この範囲を収集",
+        type="primary",
+        use_container_width=True,
+        disabled=not selected_venues,
+    )
+
+    if start_collect:
+        progress = st.progress(0)
+        status = st.empty()
+        total = max(request_estimate, 1)
+        done = 0
+        saved = 0
+        failed = 0
+        current_date = collect_start
+
+        while current_date <= collect_end:
+            date8 = current_date.strftime("%Y%m%d")
+            for venue_name in selected_venues:
+                code = VENUES[venue_name]
+                for race_no_item in range(1, int(race_limit) + 1):
+                    status.write(
+                        f"取得中：{current_date} {venue_name}{race_no_item}R"
+                    )
+                    ok, message = collect_one_race(
+                        date8, venue_name, code, race_no_item
+                    )
+                    done += 1
+                    if ok:
+                        saved += 1
+                    elif message != "結果なし":
+                        failed += 1
+                    progress.progress(min(done / total, 1.0))
+                    time.sleep(0.08)
+
+            next_day = current_date + timedelta(days=1)
+            save_collection_state(
+                next_date=next_day.isoformat(),
+                start_date=collect_start.isoformat(),
+                end_date=collect_end.isoformat(),
+                selected_venues=json.dumps(selected_venues, ensure_ascii=False),
+                updated_at=datetime.now(JST).isoformat(),
+                collected_races=int(state.get("collected_races", 0)) + saved,
+                failed_requests=int(state.get("failed_requests", 0)) + failed,
+            )
+            current_date = next_day
+
+        status.success(f"完了：新規・更新 {saved}レース／通信失敗 {failed}件")
+        st.session_state["v14_collection_done"] = True
+
+    results = historical_results_df()
+    r1,r2,r3,r4 = st.columns(4)
+    r1.metric("保存済みレース", f"{len(results):,}")
+    r2.metric(
+        "保存済み日数",
+        f"{results['race_date'].nunique():,}" if not results.empty else "0",
+    )
+    r3.metric(
+        "保存済み場数",
+        f"{results['venue'].nunique():,}" if not results.empty else "0",
+    )
+    r4.metric(
+        "次回開始候補",
+        collection_state().get("next_date") or "未開始",
+    )
+
+    if not results.empty:
+        st.download_button(
+            "収集済み公式結果CSVをダウンロード",
+            results.to_csv(index=False).encode("utf-8-sig"),
+            file_name="boatrace_official_results.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
+        st.dataframe(results.tail(100), hide_index=True, use_container_width=True)
+
+    st.warning(
+        "この版で自動収集するのは公式の確定結果です。"
+        "梅吉AI・ポセイドンの5年前の予想履歴は公開保存状況が一定でないため、"
+        "取得可能性を確認しながら後続版で追加します。"
+    )
+
+
+with tabs[3]:
     st.header("🧠 過去レース学習")
     st.write(
         "1レースにつき複数の買い目候補をCSVで登録し、"
@@ -1210,7 +1500,7 @@ with tabs[2]:
     )
 
 
-with tabs[3]:
+with tabs[4]:
     con = db()
     history = pd.read_sql_query("SELECT * FROM predictions ORDER BY id DESC", con)
     if history.empty:
@@ -1254,7 +1544,7 @@ with tabs[3]:
             hide_index=True, use_container_width=True
         )
 
-with tabs[4]:
+with tabs[5]:
     con = db()
     history = pd.read_sql_query("SELECT * FROM predictions ORDER BY id DESC", con)
     if history.empty:
