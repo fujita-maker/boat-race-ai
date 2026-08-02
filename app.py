@@ -20,13 +20,13 @@ from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 from playwright.sync_api import sync_playwright
 
 
-APP_NAME = "WDJ Boat Race AI Web版 V30 Playwright"
+APP_NAME = "WDJ Boat Race AI Web版 V30.1 VERIFIED"
 JST = timezone(timedelta(hours=9))
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
-DB_PATH = DATA_DIR / "boat_race_v30.db"
+DB_PATH = DATA_DIR / "boat_race_v30_1.db"
 
 VENUES = {
     "桐生":"01","戸田":"02","江戸川":"03","平和島":"04","多摩川":"05","浜名湖":"06",
@@ -691,9 +691,9 @@ def optimize_training(rows: list[dict[str, Any]]) -> tuple[dict[str, Any], list[
 
 init_db()
 st.set_page_config(page_title=APP_NAME, layout="wide")
-st.title("🚤 WDJ ボートレースAI Web版 V30 Playwright")
+st.title("🚤 WDJ ボートレースAI Web版 V30.1 VERIFIED")
 st.caption(
-    "BOAT RACE公式はPlaywright Chromiumで取得し、梅吉AI・ポセイドンを統合します。"
+    "BUILD: V30.1-VERIFIED-20260803｜BOAT RACE公式はPlaywright Chromiumで取得し、梅吉AI・ポセイドンを統合します。"
 )
 
 tabs = st.tabs(["予想", "過去5年収集", "学習・検証", "データ確認"])

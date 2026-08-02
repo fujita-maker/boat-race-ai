@@ -1,17 +1,16 @@
-# WDJ Boat Race AI V30 Playwright
+# WDJ Boat Race AI V30.1 VERIFIED
 
-今回アップロードされた app.py を基準に修正したV30完成版です。
+このパッケージは、アップロードされたapp.pyを基準に修正し、
+V22表記が残っていないことを機械確認した版です。
 
-## 修正内容
+## 画面での反映確認
 
-- APP_NAMEと画面タイトルをV30へ統一
-- SQLiteファイル名をboat_race_v30.dbへ変更
-- Streamlit状態キーをv30へ統一
-- BOAT RACE公式はPlaywright Chromiumで取得
-- ポセイドン・梅吉AIはrequestsで取得
-- 情報源の状態を解析件数で表示
-- 取得エラーの詳細表示
-- オッズ未公開時は期待値や払戻額を推測しない
+正常に反映されると、画面上部に必ず次が表示されます。
+
+- `WDJ ボートレースAI Web版 V30.1 VERIFIED`
+- `BUILD: V30.1-VERIFIED-20260803`
+
+これ以外が表示された場合は、Renderが別のapp.pyを実行しています。
 
 ## GitHubへ上書きするファイル
 
@@ -20,7 +19,11 @@
 - requirements.txt
 - render.yaml
 - README.md
+- VERSION.txt
+- SHA256SUMS.txt
 
-アップロード後、Renderで
-`Manual Deploy → Clear build cache & deploy`
-を実行してください。
+## Render
+
+1. Manual Deploy
+2. Clear build cache & deploy
+3. デプロイ完了後、画面のタイトルとBUILD番号を確認
