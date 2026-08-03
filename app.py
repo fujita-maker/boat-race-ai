@@ -19,13 +19,16 @@ import requests
 import streamlit as st
 
 
-APP_NAME = "WDJ Boat Race AI Web版 V30.9 VERIFIED"
+APP_NAME = "WDJ Boat Race AI Web版 V30.12 VERIFIED"
 JST = timezone(timedelta(hours=9))
 PAYBACK_RATE = 0.75  # 3連単の平均払戻率(控除率25%). edge計測の基準に使用.
 # 買い目の厳選パラメータ(V30.6). シミュレーション結論に基づく既定値。調整可。
 MAX_BET_ODDS = 50.0  # これ超のオッズ(極端な大穴)は買い目に選ばない
 MIN_BET_PROB = 3.0   # モデル確率がこれ未満(%)の買い目は選ばない
-# 掛け金(半ケリー)パラメータ(V30.9). 破産0%・ドローダウン最小だった方法。
+# 市場補正(V30.12): AIの確率は市場より約3倍強気だったため、市場(オッズ)寄りに割り引く。
+# AI_TRUST=AIをどれだけ信じるか(0=市場のみ/1=AIそのまま)。優位性が未証明なので低め。
+AI_TRUST = 0.25
+# 掛け金(半ケリー)パラメータ(V30.12). 破産0%・ドローダウン最小だった方法。
 HALF_KELLY = 0.5          # ケリーの半分で運用(安全側)
 MAX_BET_FRACTION = 0.02   # 1点あたり資金の最大2%
 MAX_RACE_FRACTION = 0.06  # 1レース合計の最大6%
@@ -423,11 +426,21 @@ def build_prediction(source_data: dict[str, Any], bankroll: float = 30000.0) -> 
             probability = fallback
 
         odds = float(odds_map.get(combo, 0) or 0)
-        ev = probability / 100 * odds if odds else 0
+        if odds > 0:
+            # 市場(オッズ)が示す的中率でAIの強気を割り引く(市場補正)。
+            # 補正確率 = AI_TRUST×AI確率 + (1-AI_TRUST)×市場確率
+            # → 補正EV = AI_TRUST×生EV + (1-AI_TRUST)×0.75（優位性未証明なら控除率へ回帰）
+            market_pct = PAYBACK_RATE / odds * 100
+            cal_pct = AI_TRUST * probability + (1 - AI_TRUST) * market_pct
+            ev = cal_pct / 100 * odds
+        else:
+            cal_pct = probability
+            ev = 0
 
         rows.append({
             "combo":combo,
-            "model_prob":round(probability, 2),
+            "model_prob":round(cal_pct, 2),      # 市場補正後の確率(表示・判定に使用)
+            "raw_prob":round(probability, 2),    # 補正前のAI確率(参考)
             "poseidon_prob":pose or None,
             "umepyon_prob":ume or None,
             "odds":round(odds, 1) if odds else 0,
@@ -474,7 +487,7 @@ def build_prediction(source_data: dict[str, Any], bankroll: float = 30000.0) -> 
             for row in fallback_rows[:8]
         ]
 
-    # 掛け金は半ケリーで資金比率から自動算出（V30.9）
+    # 掛け金は半ケリーで資金比率から自動算出（V30.12）
     def kelly_amount(prob: float, odds: float) -> int:
         p = float(prob) / 100.0
         b = float(odds) - 1.0
@@ -824,6 +837,70 @@ def auto_collect_results(max_races: int = 300) -> tuple[int, int]:
     return saved, failed
 
 
+def backtest_fixed_strategies(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """収集済みの実結果(的中3連単＋払戻)に対し、固定ルールの回収率を総当たりで検証。
+    払戻(payout_100)は的中組の100円あたり払戻。各ルールは点数分だけ賭ける想定。"""
+    def combo_set(a: str) -> set:
+        return set(a.split("-")) if a else set()
+
+    strategies = {
+        "本命1点固定 1-2-3": (100, lambda a: a == "1-2-3"),
+        "1-2-3 ボックス(6点)": (600, lambda a: combo_set(a) == {"1", "2", "3"}),
+        "1着1号艇 固定流し(1-all 20点)": (2000, lambda a: a.startswith("1-")),
+        "1-2着に1・2号艇 固定(1-2-x 4点)": (400, lambda a: a.startswith("1-2-")),
+        "1着1・2号艇 頭(1-x-x/2-x-x 40点)": (4000, lambda a: a[:1] in ("1", "2")),
+        "1-2-3-4 ボックス(24点)": (2400, lambda a: combo_set(a) <= {"1", "2", "3", "4"}),
+    }
+    n = len(rows)
+    out = []
+    for name, (cost, cond) in strategies.items():
+        invest = cost * n
+        ret = 0
+        hits = 0
+        for r in rows:
+            a = r.get("actual_combo") or ""
+            if not a:
+                continue
+            if cond(a):
+                hits += 1
+                ret += int(r.get("payout_100") or 0)
+        roi = (ret / invest * 100) if invest else 0
+        out.append({
+            "戦略": name, "点数": cost // 100, "レース数": n,
+            "的中率": round(hits / n * 100, 1) if n else 0,
+            "回収率": round(roi, 1), "収支": ret - invest,
+        })
+    out.sort(key=lambda x: x["回収率"], reverse=True)
+    return out
+
+
+def lane1_first_rates(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """1着になった枠の分布(構造的優位の確認)と、場別の1号艇1着率。"""
+    lane = {str(i): 0 for i in range(1, 7)}
+    by_venue: dict[str, list[int]] = {}
+    n = 0
+    for r in rows:
+        a = r.get("actual_combo") or ""
+        if not a or "-" not in a:
+            continue
+        first = a.split("-")[0]
+        if first in lane:
+            lane[first] += 1
+            n += 1
+            v = r.get("venue") or "?"
+            arr = by_venue.setdefault(v, [0, 0])
+            arr[1] += 1
+            if first == "1":
+                arr[0] += 1
+    lane_pct = {k: round(v / n * 100, 1) if n else 0 for k, v in lane.items()}
+    venue_pct = sorted(
+        [{"場": v, "1号艇1着率": round(a[0] / a[1] * 100, 1), "レース数": a[1]}
+         for v, a in by_venue.items() if a[1] >= 5],
+        key=lambda x: x["1号艇1着率"], reverse=True,
+    )
+    return {"n": n, "lane_pct": lane_pct, "venue_pct": venue_pct}
+
+
 def load_joined_races() -> list[dict[str, Any]]:
     """記録済み予想と実結果を突き合わせ、オッズ付きの買い目があるレースだけ返す。"""
     con = db()
@@ -1129,7 +1206,7 @@ def render_bets_html(prediction: dict[str, Any], config: dict[str, Any]) -> str:
         max_tot = max(max_tot, tot)
         rows.append((b, blend, pose, ume, seg_p, seg_u))
     html = ('<div class="wsect">買 い 目 ・ 統 合 予 想'
-            '<span class="note">青=ポセイドン / 金=梅吉</span></div>')
+            '<span class="note">推定＝市場補正後（強気を割引）／青=ポセイドン 金=梅吉</span></div>')
     for i, (b, blend, pose, ume, seg_p, seg_u) in enumerate(rows, 1):
         odds = b.get("オッズ")
         amount = b.get("購入額", 0) or 0
@@ -1211,9 +1288,9 @@ def render_result_html(venue: str, race_no: int, race_date: Any,
 init_db()
 st.set_page_config(page_title=APP_NAME, layout="wide")
 st.markdown(WDJ_CSS, unsafe_allow_html=True)
-st.title("🚤 WDJ ボートレースAI Web版 V30.9 VERIFIED")
+st.title("🚤 WDJ ボートレースAI Web版 V30.12 VERIFIED")
 st.caption(
-    "BUILD: V30.9-VERIFIED-20260803｜公式オッズ表(120通り)を正確解析・半ケリー掛け金・買い目厳選。実データedge検証。"
+    "BUILD: V30.12-VERIFIED-20260803｜市場補正でAIの強気を割引・オッズ120通り解析・半ケリー掛け金。実データedge検証。"
 )
 
 tabs = st.tabs(["予想", "過去5年収集", "学習・検証", "データ確認", "収支・edge検証"])
@@ -1251,7 +1328,11 @@ with tabs[0]:
         sources = result["sources"]
 
         official_text = " ".join(sources.get("official", {}).values())
-        official_odds_count = len(parse_odds(official_text))
+        # オッズ数はグリッド解析(最大120)＋テキスト解析を合算した実数を表示
+        official_odds_count = len({
+            **parse_odds(official_text),
+            **(sources.get("odds_grid") or {}),
+        })
         poseidon_count = len(parse_site_probabilities(sources.get("poseidon", "")))
         umepyon_count = len(parse_site_probabilities(sources.get("umepyon", "")))
         official_any = any(sources.get("official", {}).values())
@@ -1493,4 +1574,37 @@ with tabs[4]:
         st.caption(
             "※ 優位性(回収率)がプラスでなければ、どの戦略でも長期的には資金は増えません。"
             "掛け金戦略は『リスクの形』を変えるだけで、勝ち負けの符号は変えられません。"
+        )
+
+    st.divider()
+    st.subheader("🔬 戦略バックテスト（収集済みの実結果で総当たり）")
+    st.caption(
+        "「過去5年収集」タブで集めた実際のレース結果に、固定ルールを当てはめて回収率を検証します。"
+        "予想は不要で、結果だけで測れます。※回収率100%超なら黒字。まずは多くの結果を収集してください。"
+    )
+    hist = [
+        dict(r) for r in db().execute(
+            "SELECT venue, actual_combo, payout_100 FROM historical_results "
+            "WHERE actual_combo IS NOT NULL AND actual_combo != ''"
+        ).fetchall()
+    ]
+    st.metric("検証に使える結果数", f"{len(hist):,}")
+    if len(hist) < 30:
+        st.info(
+            "実結果がまだ少ないです（目安：数百レース以上で回収率が安定します）。"
+            "「過去5年収集」タブで場・期間を広げて収集を進めてください。"
+        )
+    else:
+        st.write("**固定ルール別の回収率（回収率が高い順）**")
+        st.table(backtest_fixed_strategies(hist))
+        lr = lane1_first_rates(hist)
+        st.write("**1着になった枠の分布（構造的優位の確認）**")
+        st.table([{"枠": k, "1着率": f"{v}%"} for k, v in lr["lane_pct"].items()])
+        if lr["venue_pct"]:
+            st.write("**場別 1号艇1着率（イン有利な場ほど本命が堅い）**")
+            st.table(lr["venue_pct"][:12])
+        st.caption(
+            "※ 回収率が最も高いルールが、その期間で最も『マシ』だった買い方です。"
+            "100%を安定して超えるルールが見つかれば本物の妙味。見つからなければ、"
+            "残念ながら『勝てる買い方は無い』が実データの結論になります。"
         )
