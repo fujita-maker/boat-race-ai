@@ -19,13 +19,13 @@ import requests
 import streamlit as st
 
 
-APP_NAME = "WDJ Boat Race AI Web版 V30.8 VERIFIED"
+APP_NAME = "WDJ Boat Race AI Web版 V30.9 VERIFIED"
 JST = timezone(timedelta(hours=9))
 PAYBACK_RATE = 0.75  # 3連単の平均払戻率(控除率25%). edge計測の基準に使用.
 # 買い目の厳選パラメータ(V30.6). シミュレーション結論に基づく既定値。調整可。
 MAX_BET_ODDS = 50.0  # これ超のオッズ(極端な大穴)は買い目に選ばない
 MIN_BET_PROB = 3.0   # モデル確率がこれ未満(%)の買い目は選ばない
-# 掛け金(半ケリー)パラメータ(V30.8). 破産0%・ドローダウン最小だった方法。
+# 掛け金(半ケリー)パラメータ(V30.9). 破産0%・ドローダウン最小だった方法。
 HALF_KELLY = 0.5          # ケリーの半分で運用(安全側)
 MAX_BET_FRACTION = 0.02   # 1点あたり資金の最大2%
 MAX_RACE_FRACTION = 0.06  # 1レース合計の最大6%
@@ -57,7 +57,7 @@ HEADERS = {
 }
 CONNECT_TIMEOUT = 8
 READ_TIMEOUT = 20  # boatrace.jpは応答が遅く7秒では読み取りタイムアウトしていたため延長
-MAX_RESPONSE_BYTES = 1_400_000
+MAX_RESPONSE_BYTES = 4_000_000  # オッズ表はJSが多く大きいので上限を拡大(120セル取り切るため)
 
 
 def db() -> sqlite3.Connection:
@@ -318,19 +318,20 @@ def parse_odds3t_grid(raw_html: str) -> dict[str, float]:
     for c in cells:
         m = re.search(r"\d+(?:\.\d+)?", c)
         vals.append(float(m.group()) if m else None)  # 欠場等は None
+    # 公式の並びは「行ごとに6列(1着1〜6)が交互」。i番目のセルは:
+    #   行 r = i//6、列(=1着) k = i%6+1。
+    #   2着 = kを除く昇順の r//4 番目、3着 = k,2着を除く昇順の r%4 番目。
     grid: dict[str, float] = {}
-    i = 0
-    for first in range(1, 7):
-        for second in range(1, 7):
-            if second == first:
-                continue
-            for third in range(1, 7):
-                if third in (first, second):
-                    continue
-                v = vals[i]
-                i += 1
-                if v is not None and v > 0:
-                    grid[f"{first}-{second}-{third}"] = v
+    for i, v in enumerate(vals):
+        if v is None or v <= 0:
+            continue
+        r = i // 6
+        k = (i % 6) + 1
+        others = [x for x in range(1, 7) if x != k]
+        second = others[r // 4]
+        thirds = [x for x in range(1, 7) if x != k and x != second]
+        third = thirds[r % 4]
+        grid[f"{k}-{second}-{third}"] = v
     # 整合性チェック: 正しい3連単オッズなら Σ(1/オッズ) は概ね1.1〜1.6(控除率由来)。
     # 大きく外れる=別の数値を誤って掴んでいる → 使わない(安全策)。
     s = sum(1.0 / v for v in grid.values() if v > 0)
@@ -473,7 +474,7 @@ def build_prediction(source_data: dict[str, Any], bankroll: float = 30000.0) -> 
             for row in fallback_rows[:8]
         ]
 
-    # 掛け金は半ケリーで資金比率から自動算出（V30.8）
+    # 掛け金は半ケリーで資金比率から自動算出（V30.9）
     def kelly_amount(prob: float, odds: float) -> int:
         p = float(prob) / 100.0
         b = float(odds) - 1.0
@@ -1210,9 +1211,9 @@ def render_result_html(venue: str, race_no: int, race_date: Any,
 init_db()
 st.set_page_config(page_title=APP_NAME, layout="wide")
 st.markdown(WDJ_CSS, unsafe_allow_html=True)
-st.title("🚤 WDJ ボートレースAI Web版 V30.8 VERIFIED")
+st.title("🚤 WDJ ボートレースAI Web版 V30.9 VERIFIED")
 st.caption(
-    "BUILD: V30.8-VERIFIED-20260803｜公式オッズ表(120通り)を正確解析・半ケリー掛け金・買い目厳選。実データedge検証。"
+    "BUILD: V30.9-VERIFIED-20260803｜公式オッズ表(120通り)を正確解析・半ケリー掛け金・買い目厳選。実データedge検証。"
 )
 
 tabs = st.tabs(["予想", "過去5年収集", "学習・検証", "データ確認", "収支・edge検証"])
