@@ -19,13 +19,13 @@ import requests
 import streamlit as st
 
 
-APP_NAME = "WDJ Boat Race AI Web版 V30.6 VERIFIED"
+APP_NAME = "WDJ Boat Race AI Web版 V30.8 VERIFIED"
 JST = timezone(timedelta(hours=9))
 PAYBACK_RATE = 0.75  # 3連単の平均払戻率(控除率25%). edge計測の基準に使用.
 # 買い目の厳選パラメータ(V30.6). シミュレーション結論に基づく既定値。調整可。
 MAX_BET_ODDS = 50.0  # これ超のオッズ(極端な大穴)は買い目に選ばない
 MIN_BET_PROB = 3.0   # モデル確率がこれ未満(%)の買い目は選ばない
-# 掛け金(半ケリー)パラメータ(V30.7). 破産0%・ドローダウン最小だった方法。
+# 掛け金(半ケリー)パラメータ(V30.8). 破産0%・ドローダウン最小だった方法。
 HALF_KELLY = 0.5          # ケリーの半分で運用(安全側)
 MAX_BET_FRACTION = 0.02   # 1点あたり資金の最大2%
 MAX_RACE_FRACTION = 0.06  # 1レース合計の最大6%
@@ -256,12 +256,25 @@ def safe_fetch(url: str, retries: int = 1) -> tuple[str, str | None]:
 def fetch_live_sources(date8: str, date_iso: str, code: str, race_no: int) -> dict[str, Any]:
     urls = live_urls(date8, date_iso, code, race_no)
 
-    official_urls = {
+    official, official_errors = browser_fetch_pages({
         "racelist":urls["racelist"],
         "before":urls["before"],
-        "odds":urls["odds"],
-    }
-    official, official_errors = browser_fetch_pages(official_urls)
+    })
+
+    # オッズは生HTMLからグリッド解析するため個別取得(テキストとグリッド両方を得る)
+    odds_grid: dict[str, float] = {}
+    for attempt in range(2):
+        try:
+            odds_raw = fetch_text(urls["odds"])
+            official["odds"] = html_to_text(odds_raw)
+            odds_grid = parse_odds3t_grid(odds_raw)
+            break
+        except Exception as exc:
+            official["odds"] = official.get("odds", "")
+            if attempt == 1:
+                official_errors.append(f"odds: {exc}")
+            else:
+                time.sleep(1.0)
 
     poseidon, poseidon_error = safe_fetch(urls["poseidon"])
     umepyon, umepyon_error = safe_fetch(urls["umepyon"])
@@ -269,6 +282,7 @@ def fetch_live_sources(date8: str, date_iso: str, code: str, race_no: int) -> di
     return {
         "official":official,
         "official_errors":official_errors,
+        "odds_grid":odds_grid,
         "poseidon":poseidon,
         "poseidon_error":poseidon_error,
         "umepyon":umepyon,
@@ -286,6 +300,43 @@ def parse_odds(text: str) -> dict[str, float]:
             if len({a, b, c}) == 3:
                 result.setdefault(f"{a}-{b}-{c}", float(odds))
     return result
+
+
+def parse_odds3t_grid(raw_html: str) -> dict[str, float]:
+    """公式3連単オッズ表(グリッド)を生HTMLから解析する。
+    公式ページは組番をテキストで書かず、オッズ数値のみを表状に並べている。
+    並び順は 1着(1→6) → 2着(昇順) → 3着(昇順) の固定順で、class="oddsPoint" のセルが
+    ちょうど120個並ぶ。
+    【安全策】セルがちょうど120個取れた時だけ組番に割り当てる。数が合わなければ
+    誤った割当を避けるため空を返す(=従来の見送り動作/誤ったオッズは絶対に使わない)。"""
+    if not raw_html:
+        return {}
+    cells = re.findall(r'oddsPoint[^>]*>\s*([^<]*?)\s*<', raw_html)
+    if len(cells) != 120:
+        return {}
+    vals: list[float | None] = []
+    for c in cells:
+        m = re.search(r"\d+(?:\.\d+)?", c)
+        vals.append(float(m.group()) if m else None)  # 欠場等は None
+    grid: dict[str, float] = {}
+    i = 0
+    for first in range(1, 7):
+        for second in range(1, 7):
+            if second == first:
+                continue
+            for third in range(1, 7):
+                if third in (first, second):
+                    continue
+                v = vals[i]
+                i += 1
+                if v is not None and v > 0:
+                    grid[f"{first}-{second}-{third}"] = v
+    # 整合性チェック: 正しい3連単オッズなら Σ(1/オッズ) は概ね1.1〜1.6(控除率由来)。
+    # 大きく外れる=別の数値を誤って掴んでいる → 使わない(安全策)。
+    s = sum(1.0 / v for v in grid.values() if v > 0)
+    if not (1.05 <= s <= 1.75):
+        return {}
+    return grid
 
 
 def parse_site_probabilities(text: str) -> dict[str, float]:
@@ -340,7 +391,8 @@ def build_prediction(source_data: dict[str, Any], bankroll: float = 30000.0) -> 
     config = get_model_config()
     official_text = " ".join(source_data.get("official", {}).values())
 
-    odds_map = parse_odds(official_text)
+    # グリッド解析(正確・最大120通り)を優先し、取れなければテキスト解析にフォールバック
+    odds_map = {**parse_odds(official_text), **(source_data.get("odds_grid") or {})}
     pose_probs = parse_site_probabilities(source_data.get("poseidon", ""))
     ume_probs = parse_site_probabilities(source_data.get("umepyon", ""))
 
@@ -421,7 +473,7 @@ def build_prediction(source_data: dict[str, Any], bankroll: float = 30000.0) -> 
             for row in fallback_rows[:8]
         ]
 
-    # 掛け金は半ケリーで資金比率から自動算出（V30.7）
+    # 掛け金は半ケリーで資金比率から自動算出（V30.8）
     def kelly_amount(prob: float, odds: float) -> int:
         p = float(prob) / 100.0
         b = float(odds) - 1.0
@@ -1158,9 +1210,9 @@ def render_result_html(venue: str, race_no: int, race_date: Any,
 init_db()
 st.set_page_config(page_title=APP_NAME, layout="wide")
 st.markdown(WDJ_CSS, unsafe_allow_html=True)
-st.title("🚤 WDJ ボートレースAI Web版 V30.7 VERIFIED")
+st.title("🚤 WDJ ボートレースAI Web版 V30.8 VERIFIED")
 st.caption(
-    "BUILD: V30.7-VERIFIED-20260803｜半ケリー掛け金・買い目厳選・選手データUI。永続記録・実データedge検証。"
+    "BUILD: V30.8-VERIFIED-20260803｜公式オッズ表(120通り)を正確解析・半ケリー掛け金・買い目厳選。実データedge検証。"
 )
 
 tabs = st.tabs(["予想", "過去5年収集", "学習・検証", "データ確認", "収支・edge検証"])
