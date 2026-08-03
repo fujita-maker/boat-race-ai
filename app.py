@@ -25,6 +25,10 @@ PAYBACK_RATE = 0.75  # 3連単の平均払戻率(控除率25%). edge計測の基
 # 買い目の厳選パラメータ(V30.6). シミュレーション結論に基づく既定値。調整可。
 MAX_BET_ODDS = 50.0  # これ超のオッズ(極端な大穴)は買い目に選ばない
 MIN_BET_PROB = 3.0   # モデル確率がこれ未満(%)の買い目は選ばない
+# 掛け金(半ケリー)パラメータ(V30.7). 破産0%・ドローダウン最小だった方法。
+HALF_KELLY = 0.5          # ケリーの半分で運用(安全側)
+MAX_BET_FRACTION = 0.02   # 1点あたり資金の最大2%
+MAX_RACE_FRACTION = 0.06  # 1レース合計の最大6%
 
 BASE_DIR = Path(__file__).resolve().parent
 # APP_DATA_DIR: Renderの永続ディスクのマウント先(例 /var/data)を環境変数で指定できる。
@@ -332,7 +336,7 @@ def fallback_predictions() -> list[dict[str, Any]]:
     return top
 
 
-def build_prediction(source_data: dict[str, Any]) -> dict[str, Any]:
+def build_prediction(source_data: dict[str, Any], bankroll: float = 30000.0) -> dict[str, Any]:
     config = get_model_config()
     official_text = " ".join(source_data.get("official", {}).values())
 
@@ -417,17 +421,37 @@ def build_prediction(source_data: dict[str, Any]) -> dict[str, Any]:
             for row in fallback_rows[:8]
         ]
 
-    budget = 5000 if eligible else 0
-    amount = max(100, (budget // len(selected) // 100) * 100) if budget and selected else 0
+    # 掛け金は半ケリーで資金比率から自動算出（V30.7）
+    def kelly_amount(prob: float, odds: float) -> int:
+        p = float(prob) / 100.0
+        b = float(odds) - 1.0
+        if b <= 0 or p <= 0:
+            return 0
+        f = (b * p - (1 - p)) / b          # フルケリー配分
+        f = max(0.0, f) * HALF_KELLY       # 半ケリー
+        f = min(f, MAX_BET_FRACTION)       # 1点あたり上限
+        amt = int(round(f * bankroll / 100.0)) * 100
+        return amt if amt >= 100 else 0
+
+    if eligible:
+        stakes = [kelly_amount(row["model_prob"], row["odds"]) for row in selected]
+        cap = MAX_RACE_FRACTION * bankroll  # 1レース合計の上限
+        tot = sum(stakes)
+        if tot > cap and tot > 0:
+            scale = cap / tot
+            stakes = [max(0, int(round(s * scale / 100.0)) * 100) for s in stakes]
+    else:
+        stakes = [0] * len(selected)
+    total_stake = sum(stakes)
 
     bets: list[dict[str, Any]] = []
-    for rank, row in enumerate(selected, start=1):
+    for rank, (row, amount) in enumerate(zip(selected, stakes), start=1):
         payout = int(amount * row["odds"]) if amount and row["odds"] else 0
         bets.append({
             "順位":rank,
             "買い目":row["combo"],
             "オッズ":row["odds"] if row["odds"] else "未取得",
-            "購入額":amount if eligible else 0,
+            "購入額":amount,
             "的中時払戻":payout if payout else "未計算",
             "推定確率":f"{row['model_prob']:.2f}%",
             "期待値":row["ev"],
@@ -457,7 +481,8 @@ def build_prediction(source_data: dict[str, Any]) -> dict[str, Any]:
             3,
         ),
         "bets":bets,
-        "budget":budget,
+        "total_stake":total_stake,
+        "bankroll":bankroll,
     }
 
 
@@ -1054,8 +1079,11 @@ def render_bets_html(prediction: dict[str, Any], config: dict[str, Any]) -> str:
             '<span class="note">青=ポセイドン / 金=梅吉</span></div>')
     for i, (b, blend, pose, ume, seg_p, seg_u) in enumerate(rows, 1):
         odds = b.get("オッズ")
+        amount = b.get("購入額", 0) or 0
+        buy_line = (f'<div style="font-size:12px;color:#b0894a;font-weight:600;margin-top:3px">'
+                    f'購入 ¥{amount:,}</div>') if amount else ''
         if isinstance(odds, (int, float)):
-            odds_html = f'<div class="wodds">{odds:g}<span style="font-size:11px">倍</span></div>'
+            odds_html = f'<div class="wodds">{odds:g}<span style="font-size:11px">倍</span>{buy_line}</div>'
         else:
             odds_html = '<div class="wodds"><span class="na">未取得</span></div>'
         wpid = seg_p / max_tot * 100
@@ -1102,13 +1130,20 @@ def render_result_html(venue: str, race_no: int, race_date: Any,
     action = html_lib.escape(str(prediction.get("action", "")))
     cls = html_lib.escape(str(prediction.get("classification", "")))
     ev = prediction.get("avg_ev", 0)
+    total_stake = int(prediction.get("total_stake", 0) or 0)
+    bankroll = float(prediction.get("bankroll", 0) or 0)
     ring = (f'<div class="wring" style="background:conic-gradient(#1f6f7d {conf}%,#e9e3d7 0)">'
             f'<div class="v"><b class="wmn">{conf}</b><small>自信度</small></div></div>')
+    stake_chip = ''
+    if total_stake > 0:
+        pct = (total_stake / bankroll * 100) if bankroll else 0
+        stake_chip = (f'<span class="wchip" style="border-color:#c9dccc;color:#2f7a55">'
+                      f'推奨総額 ¥{total_stake:,}（資金の{pct:.1f}%）</span>')
     verdict = (
         f'<div class="wcard wverdict">{ring}<div class="wv">'
         f'<div class="lbl">最 終 判 断</div><div class="big wmn">{action}</div>'
         f'<div><span class="wchip">{cls}</span>'
-        f'<span class="wchip ev">参考期待値 {ev}</span></div></div></div>'
+        f'<span class="wchip ev">参考期待値 {ev}</span>{stake_chip}</div></div></div>'
     )
     head = (f'<div style="text-align:center;margin:6px 0 14px">'
             f'<span class="wmn" style="font-size:22px;font-weight:600">{html_lib.escape(venue)}</span>'
@@ -1123,18 +1158,23 @@ def render_result_html(venue: str, race_no: int, race_date: Any,
 init_db()
 st.set_page_config(page_title=APP_NAME, layout="wide")
 st.markdown(WDJ_CSS, unsafe_allow_html=True)
-st.title("🚤 WDJ ボートレースAI Web版 V30.6 VERIFIED")
+st.title("🚤 WDJ ボートレースAI Web版 V30.7 VERIFIED")
 st.caption(
-    "BUILD: V30.6-VERIFIED-20260803｜新UI(選手データ＋統合買い目)。永続記録・実データedge検証。"
+    "BUILD: V30.7-VERIFIED-20260803｜半ケリー掛け金・買い目厳選・選手データUI。永続記録・実データedge検証。"
 )
 
 tabs = st.tabs(["予想", "過去5年収集", "学習・検証", "データ確認", "収支・edge検証"])
 
 with tabs[0]:
-    c1, c2, c3 = st.columns(3)
+    c1, c2, c3, c4 = st.columns(4)
     race_date = c1.date_input("開催日", datetime.now(JST).date())
     venue = c2.selectbox("場", list(VENUES))
     race_no = c3.selectbox("R", range(1, 13))
+    bankroll = c4.number_input(
+        "資金(円)", min_value=1000, max_value=100_000_000,
+        value=int(st.session_state.get("v30_bankroll", 30000)), step=1000,
+    )
+    st.session_state["v30_bankroll"] = int(bankroll)
 
     if st.button("3サイト取得 → 予想を表示", type="primary", use_container_width=True):
         with st.spinner("3サイトを取得中…"):
@@ -1144,7 +1184,7 @@ with tabs[0]:
                 VENUES[venue],
                 race_no,
             )
-            prediction = build_prediction(sources)
+            prediction = build_prediction(sources, float(bankroll))
 
         st.session_state["v30_result"] = {
             "selection":f"{race_date}-{venue}-{race_no}",
