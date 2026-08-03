@@ -19,9 +19,12 @@ import requests
 import streamlit as st
 
 
-APP_NAME = "WDJ Boat Race AI Web版 V30.5 VERIFIED"
+APP_NAME = "WDJ Boat Race AI Web版 V30.6 VERIFIED"
 JST = timezone(timedelta(hours=9))
 PAYBACK_RATE = 0.75  # 3連単の平均払戻率(控除率25%). edge計測の基準に使用.
+# 買い目の厳選パラメータ(V30.6). シミュレーション結論に基づく既定値。調整可。
+MAX_BET_ODDS = 50.0  # これ超のオッズ(極端な大穴)は買い目に選ばない
+MIN_BET_PROB = 3.0   # モデル確率がこれ未満(%)の買い目は選ばない
 
 BASE_DIR = Path(__file__).resolve().parent
 # APP_DATA_DIR: Renderの永続ディスクのマウント先(例 /var/data)を環境変数で指定できる。
@@ -376,19 +379,29 @@ def build_prediction(source_data: dict[str, Any]) -> dict[str, Any]:
 
     rows.sort(key=lambda row: (row["model_prob"], row["ev"]), reverse=True)
 
+    # シミュレーションの結論に基づく厳選ロジック（V30.6）:
+    #  ・極端な大穴は不利 → オッズ上限で除外（大穴の期待値水増しを防ぐ）
+    #  ・本命〜中穴のみ → モデル確率の下限
+    #  ・妙味がある時だけ買う → 期待値(=確率×オッズ)がしきい値以上
+    # 条件を満たす買い目が無ければ「見送り」。
     eligible_rows = [
         row for row in rows
-        if row["odds"] > 0 and row["ev"] >= float(config["ev_threshold"])
+        if row["odds"] > 0
+        and row["odds"] <= MAX_BET_ODDS
+        and row["model_prob"] >= MIN_BET_PROB
+        and row["ev"] >= float(config["ev_threshold"])
     ]
-    eligible = len(eligible_rows) >= 3
+    eligible = len(eligible_rows) >= 1
 
     if eligible:
+        # 妙味のある買い目を、期待値の高い順に最大 max_bets 点まで（少点数厳選）
         selected = sorted(
             eligible_rows,
             key=lambda row: (row["ev"], row["model_prob"]),
             reverse=True,
         )[:int(config["max_bets"])]
     else:
+        # 見送り時は「本命順」の上位を参考表示（大穴ではなく高確率の買い目）
         selected = rows[:int(config["max_bets"])]
 
     if not selected:
@@ -835,7 +848,7 @@ def replay_staking(joined: list[dict[str, Any]], init: float = 300000.0) -> list
 
 
 # ============================================================
-# 選手データ解析 と 新UI描画 (V30.5)
+# 選手データ解析 と 新UI描画 (V30.6)
 # ============================================================
 def _to_f(s: Any) -> float | None:
     try:
@@ -1110,9 +1123,9 @@ def render_result_html(venue: str, race_no: int, race_date: Any,
 init_db()
 st.set_page_config(page_title=APP_NAME, layout="wide")
 st.markdown(WDJ_CSS, unsafe_allow_html=True)
-st.title("🚤 WDJ ボートレースAI Web版 V30.5 VERIFIED")
+st.title("🚤 WDJ ボートレースAI Web版 V30.6 VERIFIED")
 st.caption(
-    "BUILD: V30.5-VERIFIED-20260803｜新UI(選手データ＋統合買い目)。永続記録・実データedge検証。"
+    "BUILD: V30.6-VERIFIED-20260803｜新UI(選手データ＋統合買い目)。永続記録・実データedge検証。"
 )
 
 tabs = st.tabs(["予想", "過去5年収集", "学習・検証", "データ確認", "収支・edge検証"])
