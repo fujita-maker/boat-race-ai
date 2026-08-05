@@ -458,10 +458,17 @@ function calc(){
  const motorN=norm(data.map(d=>d.motor)),stN=norm(data.map(d=>d.st),true),exN=norm(data.map(d=>d.ex),true),
        locN=norm(data.map(d=>d.loc)),natN=norm(data.map(d=>d.nat));
  const clsN=data.map(d=>CLASS_SCORE[d.cls]??0.33),inner=data.map(d=>(6-d.course)/5);
- // コース補正は実際の平均1着率(生のCOURSE_BASE)を使う（正規化しない＝1号艇が常に最大にならない）
- const cbase=data.map(d=>COURSE_BASE[d.course]??0.05);
- const quality=data.map((d,i)=>0.30*clsN[i]+0.25*natN[i]+0.20*motorN[i]+0.15*stN[i]+0.10*locN[i]);
- const power=data.map((d,i)=>0.45*cbase[i]+0.55*quality[i]);  // 実力寄り：強い外艇が頭を取れる
+ // ===== 学習済みモデル（過去約4530レースで較正した1着確率）=====
+ // 特徴順: [course_base, class, nat, loc, motor, st, ex]
+ const L_BETA=[0.6958,0.1224,0.728,0.0152,0.1583,-0.0137,-0.421];
+ const L_MU=[0.1668,0.5436,5.2401,4.6892,32.7627,0.088,6.826];
+ const L_SD=[0.1764,0.3059,1.3348,2.1123,11.0123,0.1053,0.1136];
+ const scores=data.map(d=>{
+   const f=[COURSE_BASE[d.course]??0.05, CLASS_SCORE[d.cls]??0.33, d.nat, d.loc, d.motor, d.st, d.ex];
+   let s=0; for(let k=0;k<7;k++){const z=(f[k]-L_MU[k])/L_SD[k]; if(!isNaN(z)) s+=L_BETA[k]*z;} return s;
+ });
+ const _mx=Math.max(...scores),_e=scores.map(s=>Math.exp(s-_mx)),_sm=_e.reduce((a,b)=>a+b,0)||1;
+ const power=_e.map(e=>e/_sm);   // 1着力 ＝ 学習済み1着確率（合計1）
  const pRank=[...power.keys()].sort((a,b)=>power[b]-power[a]);
  const sel=document.getElementById('axisSel').value;
  let axisIdx=(sel==='auto')?pRank[0]:(+sel-1);
@@ -496,9 +503,10 @@ function calc(){
  evList.sort((a,b)=>b.ev-a.ev);
  const evBuys=evList.filter(e=>e.ev>0);
  const confEl=document.getElementById('conf');let cCls;const autoTop=res[pRank[0]],second=res[pRank[1]];
- if(relGap>=0.35){cCls='cHi';confEl.innerHTML=`1着信頼度：<b>高</b>（${autoTop.frame}号艇が抜けている＝堅い逃げ）`;}
- else if(relGap>=0.18){cCls='cMid';confEl.innerHTML=`1着信頼度：<b>中</b>（${autoTop.frame}号艇本命だが${second.frame}号艇と差は小さい）`;}
- else{cCls='cLow';confEl.innerHTML=`1着信頼度：<b>低 ⚠ 荒れ注意</b>（${autoTop.frame}と${second.frame}が拮抗＝頭が読めない＝<b>見送り</b>検討）`;}
+ const headProb=power[pRank[0]]*100;  // 学習モデルの頭の1着確率
+ if(headProb>=70){cCls='cHi';confEl.innerHTML=`1着信頼度：<b>高</b>（${autoTop.frame}号艇の1着確率 <b>${headProb.toFixed(0)}%</b>＝学習モデルで堅い）`;}
+ else if(headProb>=60){cCls='cMid';confEl.innerHTML=`1着信頼度：<b>中</b>（${autoTop.frame}号艇の1着確率 <b>${headProb.toFixed(0)}%</b>）`;}
+ else{cCls='cLow';confEl.innerHTML=`1着信頼度：<b>低 ⚠ 見送り推奨</b>（${autoTop.frame}号艇でも1着確率 <b>${headProb.toFixed(0)}%</b>＝学習モデルの推奨しきい値60%未満）`;}
  if(sel!=='auto'&&axisIdx!==pRank[0])confEl.innerHTML+=`　／ 自動推奨頭は${autoTop.frame}号艇（手動で${axis.frame}号艇指定中）`;
  confEl.className='conf '+cCls;
  const order=[axis,...cand];const rowsEl=document.getElementById('rows');rowsEl.innerHTML='';

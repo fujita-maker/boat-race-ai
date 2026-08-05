@@ -1,10 +1,5 @@
-【過去データ学習(較正)エンジンを追加した版】
-新規：
- - /api/train … サーバー側で過去レースを集めて「1着確率モデル」を学習し、
-   学習済み重み・較正表・推奨しきい値を返す（購入/見送りの精度較正用）。
- - numpy を依存に追加。
-アップロード：
- 1. GitHub の boat-race-ai に app.py と requirements.txt を上げて commit（上書き）
- 2. Render → Manual Deploy → Deploy latest commit
- 3. 「Application startup complete」を確認
-デプロイ後、こちらで /api/train を実行して学習し、結果の重みをアプリに反映します。
+【学習結果を“画面判定”に組み込んだ最終版】
+ - 頭(1着)の判定＝過去4530レースで学習した1着確率モデルに置換。
+ - 1着信頼度は「1号艇の1着確率○%」で表示。60%未満は自動で「見送り推奨」（赤）。
+ - これが噛み合っていれば、信頼度に必ず「○%」の数字が出ます（出ない＝古い版）。
+アップロード：app.py を上書き → Render → Manual Deploy → Deploy latest commit。
