@@ -296,6 +296,135 @@ def api_train(days: int = Query(84), step: int = Query(3), iters: int = Query(30
     res.update({"ok": True, "used_days": used_days, "seconds": round(time.time() - t0, 1)})
     return res
 
+# ================= バックテスト（時系列分割・実結果/実配当で 見送り×点数 を総当たり）=================
+def _payouts(race):
+    combos = []
+    _collect_with_key(race, "combination", combos)
+    ex = tri = None
+    for c in combos:
+        s = str(c.get("combination", "")); amt = c.get("amount")
+        if amt is None:
+            continue
+        if s.count("-") == 2 and tri is None:
+            tri = (s, float(amt))
+        elif s.count("-") == 1 and ex is None:
+            ex = (s, float(amt))
+    return ex, tri
+
+def race_full(race):
+    fx = race_to_features(race)
+    if fx is None:
+        return None
+    X, winner = fx
+    ex, tri = _payouts(race)
+    if tri is None:
+        return None
+    try:
+        order = [int(x) for x in tri[0].split("-")]
+    except ValueError:
+        return None
+    if len(order) != 3:
+        return None
+    return {"X": X, "winner": winner, "order": order,
+            "ex_amt": (ex[1] if ex else None), "tri_amt": tri[1]}
+
+def collect_full(days, step):
+    today = dt.datetime.now(dt.timezone(dt.timedelta(hours=9))).date()
+    recs = []
+    for d in range(1, days + 1, max(1, step)):
+        day = today - dt.timedelta(days=d)
+        hd = day.strftime("%Y%m%d")
+        try:
+            data = fetch_openapi(hd)
+        except Exception:
+            continue
+        progs = data.get("programs", data) if isinstance(data, dict) else data
+        stadiums = progs.get("stadiums") if isinstance(progs, dict) else None
+        if not stadiums:
+            continue
+        for s in _as_items(stadiums):
+            for rc in _as_items(s.get("races") if isinstance(s, dict) else None):
+                if not isinstance(rc, dict):
+                    continue
+                r = race_full(rc)
+                if r:
+                    r["day"] = d
+                    recs.append(r)
+    return recs
+
+def api_backtest_core(days, step, iters):
+    recs = collect_full(days, step)
+    if len(recs) < 300:
+        return {"ok": False, "error": f"データ不足({len(recs)})"}
+    recs.sort(key=lambda r: -r["day"])   # 古い順
+    n = len(recs); cut = int(n * 0.7)
+    train, test = recs[:cut], recs[cut:]
+    m = train_conditional_logit([r["X"] for r in train], [r["winner"] for r in train], iters=iters)
+    beta = np.array(m["beta"]); mu = np.array(m["mu"]); sd = np.array(m["sd"])
+    for r in test:
+        Z = (np.asarray(r["X"], float) - mu) / sd
+        sc = Z @ beta
+        e = np.exp(sc - sc.max()); p = e / e.sum()
+        axis = int(sc.argmax())
+        r["axis"] = axis + 1; r["headP"] = float(p[axis])
+        others = sorted([i for i in range(6) if i != axis], key=lambda i: -sc[i])
+        r["secs"] = [i + 1 for i in others]
+    THRS = [0.0, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80]
+    TICKETS = [("2連単1点", 2, 1), ("2連単2点", 2, 2),
+               ("3連単F 軸-2-全", 3, 2), ("3連単F 軸-3-全", 3, 3), ("3連単1点", 3, 1)]
+    N = len(test); results = []
+    for thr in THRS:
+        for name, kind, k in TICKETS:
+            staked = returned = hits = nb = 0; profits = []
+            for r in test:
+                if r["headP"] < thr:
+                    continue
+                picks = r["secs"][:k]
+                if kind == 2:
+                    if r["ex_amt"] is None:
+                        continue
+                    cost = k * 100
+                    win = (r["order"][0] == r["axis"] and r["order"][1] in picks)
+                    pay = r["ex_amt"] if win else 0
+                elif name == "3連単1点":
+                    second = r["secs"][0]; third = r["secs"][1]
+                    cost = 100
+                    win = (r["order"] == [r["axis"], second, third])
+                    pay = r["tri_amt"] if win else 0
+                else:
+                    cost = k * 4 * 100
+                    win = (r["order"][0] == r["axis"] and r["order"][1] in picks)
+                    pay = r["tri_amt"] if win else 0
+                staked += cost; returned += pay; nb += 1
+                if win:
+                    hits += 1
+                profits.append(pay - cost)
+            if nb < 20:
+                continue
+            cum = peak = dd = 0
+            for pf in profits:
+                cum += pf; peak = max(peak, cum); dd = min(dd, cum - peak)
+            arr = np.array(profits, float)
+            results.append({
+                "見送り条件": (f"1着確率>={int(thr*100)}%" if thr > 0 else "全レース購入"),
+                "点数": name, "購入数": nb, "見送り率": round((N - nb) / N * 100, 1),
+                "的中率": round(hits / nb * 100, 1), "回収率": round(returned / staked * 100, 1) if staked else 0,
+                "総利益": int(returned - staked), "最大DD": int(dd),
+                "シャープ": round(float(arr.mean() / (arr.std() + 1e-9)), 3),
+            })
+    results.sort(key=lambda x: -x["回収率"])
+    return {"ok": True, "n_train": len(train), "n_test": N,
+            "model_test_acc": m["test_acc"], "baseline_course1": m["baseline_course1"],
+            "top": results[:12], "strategies_tested": len(results)}
+
+@app.get("/api/backtest")
+def api_backtest(days: int = Query(180), step: int = Query(6), iters: int = Query(250)):
+    t0 = time.time()
+    res = api_backtest_core(days, step, iters)
+    if isinstance(res, dict) and res.get("ok"):
+        res["seconds"] = round(time.time() - t0, 1)
+    return JSONResponse(res)
+
 # ---- フロント（HTMLを埋め込み：別ファイル不要で確実に配信）----
 INDEX_HTML = r'''<!DOCTYPE html>
 <html lang="ja">
