@@ -195,7 +195,13 @@ INDEX_HTML = r'''<!DOCTYPE html>
   h2{font-size:15px;margin:2px 0 12px;color:#12263a;border-bottom:2px solid #e5ebf1;padding-bottom:6px;}
   table{border-collapse:collapse;width:100%;font-size:13px;} th,td{border:1px solid #dbe2ea;padding:5px 6px;text-align:center;}
   th{background:#eef3f8;font-weight:700;color:#33475b;} td input,td select{width:100%;border:1px solid #cfd8e3;border-radius:5px;padding:5px 4px;font-size:13px;text-align:center;background:#fbfdff;}
-  td.frame{font-weight:800;color:#fff;} .b1{background:#e64c4c;}.b2{background:#1f6fd0;}.b3{background:#3aa655;}.b4{background:#e6a600;color:#3a2a00;}.b5{background:#2a2a2a;}.b6{background:#e6669e;}
+  td.frame{font-weight:800;}
+  .chip.b1,td.frame.b1{background:#ffffff;color:#222;border:1.5px solid #b7bec6;}
+  .chip.b2,td.frame.b2{background:#1a1a1a;color:#fff;}
+  .chip.b3,td.frame.b3{background:#e6303a;color:#fff;}
+  .chip.b4,td.frame.b4{background:#1f6fd0;color:#fff;}
+  .chip.b5,td.frame.b5{background:#f4c430;color:#333;}
+  .chip.b6,td.frame.b6{background:#3aa655;color:#fff;}
   .oddscol{background:#fff9ec!important;}
   button{background:#1f6fd0;color:#fff;border:none;border-radius:8px;padding:10px 20px;font-size:14px;font-weight:700;cursor:pointer;}
   button:hover{background:#175bb0;} .btn2{background:#5a6b7d;font-size:13px;padding:8px 14px;}
