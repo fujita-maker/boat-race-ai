@@ -1,0 +1,15 @@
+【GitHubへの上げ方】
+1. GitHub で fujita-maker/boat-race-ai を開く
+2. 「Add file」→「Upload files」
+3. このフォルダの3つのファイルをドラッグ＆ドロップ：
+     - app.py
+     - requirements.txt
+     - Dockerfile
+   （同名ファイルは上書きされます。古い index.html や static フォルダ、
+     streamlit 用ファイルが残っていれば削除してOK。app.py 1個で画面まで動きます）
+4. 緑の「Commit changes」を押す
+5. Render → 右上「Manual Deploy」→「Deploy latest commit」
+6. ログに「Application startup complete」「Your service is live」と出たら成功
+7. https://boat-race-ai-cxwk.onrender.com を開く → 予想画面が表示されます
+
+※必要なファイルは app.py / requirements.txt / Dockerfile の3つだけです。
