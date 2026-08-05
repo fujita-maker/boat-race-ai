@@ -119,7 +119,7 @@ def fetch_exacta_odds(jcd: int, rno: int, hd: str) -> Optional[dict]:
         return None
     soup = BeautifulSoup(r.text, "lxml")
     cells = soup.select("td.oddsPoint")
-    # 2連単は 30通り。1着列(1..6)×2着行の並びを想定して読む。
+    # 2連単は 30通り。
     vals = []
     for c in cells:
         t = c.get_text(strip=True).replace(",", "")
@@ -130,13 +130,17 @@ def fetch_exacta_odds(jcd: int, rno: int, hd: str) -> Optional[dict]:
     if len(vals) < 30:
         return None
     vals = vals[:30]
-    # boatrace.jp の2連単表は「1着1→(2,3,4,5,6)」「1着2→(1,3,4,5,6)」… の順で
-    # oddsPoint セルが並ぶ想定（列＝1着、各列に5つの2着オッズ）。
-    odds = {}  # (first, second) -> odds
+    # boatrace.jp の2連単表は「1着1〜6の6列」を横に並べた1枚の表になっており、
+    # oddsPoint セルは行方向（各行=6列分の値）にDOM上並んでいる想定。
+    # 各列(=1着番号)内では「自分以外の艇番を昇順」で1行ずつ値が並ぶ。
+    # 誤って列方向（1着1の5個→1着2の5個…）で読むと、2個目以降が全てズレて
+    # 全く別の組み合わせのオッズを拾ってしまうため、行方向で正しく復元する。
+    seconds_by_first = {f: [s for s in range(1, 7) if s != f] for f in range(1, 7)}
+    odds = {}
     idx = 0
-    for first in range(1, 7):
-        seconds = [s for s in range(1, 7) if s != first]
-        for second in seconds:
+    for row_i in range(5):
+        for first in range(1, 7):
+            second = seconds_by_first[first][row_i]
             odds[(first, second)] = vals[idx]
             idx += 1
     return {f"{k[0]}-{k[1]}": v for k, v in odds.items()}
@@ -271,7 +275,7 @@ const VENUES={1:'桐生',2:'戸田',3:'江戸川',4:'平和島',5:'多摩川',6:
 const CC=['b1','b2','b3','b4','b5','b6'];
 const CLASS_SCORE={'A1':1.0,'A2':0.66,'B1':0.33,'B2':0.0};
 const COURSE_BASE={1:0.55,2:0.15,3:0.12,4:0.10,5:0.06,6:0.02};
-let lastData=null, autoTimer=null;
+let lastData=null, autoTimer=null, lastOddsAll=null;
 
 function initSelectors(){
   const j=document.getElementById('jcd');
@@ -310,6 +314,7 @@ async function fetchRace(){
     const res=await fetch(`/api/race?jcd=${jcd}&rno=${rno}&hd=${hd}`);
     const j=await res.json();
     if(!j.ok){st.innerHTML='⚠ '+ (j.error||'取得失敗'); return;}
+    lastOddsAll=j.odds_all||null;
     buildRows(j.boats.map(b=>({course:b.course, cls:b.cls||'B1',
       nat:b.nat??'', loc:b.loc??'', motor:b.motor??'', ex:b.ex??'', st:b.st??'', odds:b.odds??''})));
     const cls = j.odds_status.startsWith('ライブ')?'live':'est';
@@ -330,17 +335,29 @@ function calc(){
  const motorN=norm(data.map(d=>d.motor)),stN=norm(data.map(d=>d.st),true),exN=norm(data.map(d=>d.ex),true),
        locN=norm(data.map(d=>d.loc)),natN=norm(data.map(d=>d.nat));
  const clsN=data.map(d=>CLASS_SCORE[d.cls]??0.33),inner=data.map(d=>(6-d.course)/5);
- const cbase=data.map(d=>COURSE_BASE[d.course]??0.05),cbaseN=norm(cbase);
+ // コース補正は実際の平均1着率(COURSE_BASE)をそのまま使う（min-max正規化しない）。
+ // 正規化するとコース1が常に1.0になり、実力がどれだけ低くても他艇が逆転不可能になってしまうため。
+ const cbase=data.map(d=>COURSE_BASE[d.course]??0.05);
  const quality=data.map((d,i)=>0.30*clsN[i]+0.25*natN[i]+0.20*motorN[i]+0.15*stN[i]+0.10*locN[i]);
- const power=data.map((d,i)=>0.60*cbaseN[i]+0.40*quality[i]);
+ // 重みを実力寄りにし、実力差が大きければコース有利を覆せるようにする。
+ const power=data.map((d,i)=>0.45*cbase[i]+0.55*quality[i]);
  const pRank=[...power.keys()].sort((a,b)=>power[b]-power[a]);
  const sel=document.getElementById('axisSel').value;
  let axisIdx=(sel==='auto')?pRank[0]:(+sel-1);
  const relGap=(power[pRank[0]]-power[pRank[1]])/power[pRank[0]];
- const impl=data.map(d=>d.odds!=null?1/d.odds:null),implN=norm(impl,false);
+ const axisFrame=axisIdx+1;
+ // 軸→各艇の実オッズは、直取得した全30通り(lastOddsAll)から「今選ばれている軸」に対応する値を都度引く。
+ // 以前は取得時点のコース1軸のオッズが固定で入っており、軸を切り替えても更新されなかった。
+ const liveOdds=data.map((d,i)=>{
+   if(i===axisIdx) return null;
+   if(lastOddsAll){const v=lastOddsAll[`${axisFrame}-${i+1}`]; if(v!=null) return v;}
+   return d.odds; // 実オッズが引けない時だけ手入力/初期値にフォールバック
+ });
+ const impl=liveOdds.map(v=>v!=null?1/v:null),implN=norm(impl,false);
  const res=data.map((d,i)=>{const J=0.40*motorN[i]+0.25*stN[i]+0.20*exN[i]+0.15*locN[i];
-   const M=d.odds!=null?implN[i]:0.45*clsN[i]+0.35*natN[i]+0.20*inner[i];
-   return{i,frame:i+1,course:d.course,power:power[i],J,M,Y:J-M,byOdds:d.odds!=null};});
+   const odds_i=liveOdds[i];
+   const M=odds_i!=null?implN[i]:0.45*clsN[i]+0.35*natN[i]+0.20*inner[i];
+   return{i,frame:i+1,course:d.course,power:power[i],J,M,Y:J-M,byOdds:odds_i!=null,odds:odds_i};});
  const axis=res[axisIdx];
  const width=parseInt(document.getElementById('width').value);
  const cand=res.filter(r=>r.i!==axis.i).sort((a,b)=>b.Y-a.Y);
