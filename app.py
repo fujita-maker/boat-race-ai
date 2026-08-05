@@ -4,6 +4,7 @@
 - 2連単オッズ: boatrace.jp を best-effort スクレイプ（取れなければ null → フロントは推定にフォールバック）
 FastAPI / Render 対応。
 """
+import os
 import time
 import datetime as dt
 from typing import Any, Optional
@@ -175,8 +176,23 @@ def api_race(jcd: int = Query(...), rno: int = Query(...),
     }
 
 # ---- 静的フロント ----
+# index.html は static/ でもリポジトリ直下でもOK（アップロード方法で構造が変わっても動く）
+def _find_index() -> Optional[str]:
+    here = os.path.dirname(os.path.abspath(__file__))
+    for p in ("static/index.html", "index.html",
+              os.path.join(here, "static", "index.html"),
+              os.path.join(here, "index.html")):
+        if os.path.exists(p):
+            return p
+    return None
+
 @app.get("/")
 def index():
-    return FileResponse("static/index.html")
+    p = _find_index()
+    if p:
+        return FileResponse(p)
+    return JSONResponse({"ok": False, "error": "index.html が見つかりません（リポジトリに含めてください）"}, status_code=500)
 
-app.mount("/static", StaticFiles(directory="static"), name="static")
+# static/ が存在する時だけ /static を配信（無くても起動は失敗しない）
+if os.path.isdir("static"):
+    app.mount("/static", StaticFiles(directory="static"), name="static")
