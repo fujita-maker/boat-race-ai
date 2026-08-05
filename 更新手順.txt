@@ -1,12 +1,10 @@
-【EV(期待値)判定を追加した更新版】
-変更点：
- - 2連単オッズの並び順を修正（公式と数値一致を確認済み）
- - 1着軸の重みを実力寄りに（0.45コース/0.55実力・生CB）＝1号艇に寄りすぎない
- - オッズが選択中の軸に追従
- - 「期待値(EV)の試算」を追加（ライブオッズ×推定確率でEVを表示）
-   ※EVは未較正の暫定モデル。高オッズ艇のEVプラスは穴の過大評価の可能性大＝買い推奨ではなく参考値。
-
-上げ方：
- 1. GitHub の boat-race-ai で app.py を、この app.py に丸ごと置き換えて commit
+【過去データ学習(較正)エンジンを追加した版】
+新規：
+ - /api/train … サーバー側で過去レースを集めて「1着確率モデル」を学習し、
+   学習済み重み・較正表・推奨しきい値を返す（購入/見送りの精度較正用）。
+ - numpy を依存に追加。
+アップロード：
+ 1. GitHub の boat-race-ai に app.py と requirements.txt を上げて commit（上書き）
  2. Render → Manual Deploy → Deploy latest commit
- 3. 「Application startup complete」が出たらURLを開く
+ 3. 「Application startup complete」を確認
+デプロイ後、こちらで /api/train を実行して学習し、結果の重みをアプリに反映します。

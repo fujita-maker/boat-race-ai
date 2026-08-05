@@ -9,6 +9,7 @@ import time
 import datetime as dt
 from typing import Any, Optional
 
+import numpy as np
 import requests
 from bs4 import BeautifulSoup
 from fastapi import FastAPI, Query
@@ -176,6 +177,124 @@ def api_race(jcd: int = Query(...), rno: int = Query(...),
         "updated_at": now.strftime("%H:%M:%S"),
         "note": "出走表/直前はopenapi(約3分更新)、オッズはboatrace.jp best-effort",
     }
+
+# ================= 過去データ学習（条件付きロジットで1着確率を較正）=================
+_CLASS = {"A1": 1.0, "A2": 0.66, "B1": 0.33, "B2": 0.0}
+_CBASE = {1: 0.55, 2: 0.15, 3: 0.12, 4: 0.10, 5: 0.06, 6: 0.02}
+
+def _num(v, default):
+    try:
+        f = float(v)
+        return f
+    except (TypeError, ValueError):
+        return default
+
+def race_to_features(race: dict):
+    """1レースを (6艇×7特徴, 勝者index) に変換。結果が無ければ None。"""
+    boats = extract_boats(race)  # frame,course,cls,nat,loc,motor,ex,st
+    # 勝者（place_number==1 の艇）
+    places = []
+    _collect_with_key(race, "place_number", places)
+    winner = None
+    for p in places:
+        if p.get("place_number") == 1 and p.get("entry_number"):
+            winner = int(p["entry_number"])
+            break
+    if winner is None:
+        return None
+    X = []
+    for b in boats:
+        X.append([
+            _CBASE.get(b["course"], 0.05),
+            _CLASS.get(b["cls"], 0.33),
+            _num(b["nat"], 5.0),
+            _num(b["loc"], 5.0),
+            _num(b["motor"], 35.0),
+            _num(b["st"], 0.16),
+            _num(b["ex"], 6.80),
+        ])
+    return X, winner - 1  # index 0-5
+
+def collect_dataset(days: int, step: int):
+    """今日からdays日分をstep間隔でサンプルし、(X, winners) を集める。"""
+    today = dt.datetime.now(dt.timezone(dt.timedelta(hours=9))).date()
+    Xs, ws, used_days = [], [], 0
+    for d in range(1, days + 1, max(1, step)):
+        day = today - dt.timedelta(days=d)
+        hd = day.strftime("%Y%m%d")
+        try:
+            data = fetch_openapi(hd)
+        except Exception:
+            continue
+        progs = data.get("programs", data) if isinstance(data, dict) else data
+        stadiums = progs.get("stadiums") if isinstance(progs, dict) else None
+        if not stadiums:
+            continue
+        got = 0
+        for s in _as_items(stadiums):
+            for rc in _as_items(s.get("races") if isinstance(s, dict) else None):
+                if not isinstance(rc, dict):
+                    continue
+                fx = race_to_features(rc)
+                if fx:
+                    Xs.append(fx[0]); ws.append(fx[1]); got += 1
+        if got:
+            used_days += 1
+    return Xs, ws, used_days
+
+def train_conditional_logit(X, winners, iters=300, lr=0.4):
+    X = np.asarray(X, float); winners = np.asarray(winners, int)
+    R = len(X)
+    flat = X.reshape(-1, X.shape[2])
+    mu = flat.mean(0); sd = flat.std(0) + 1e-9
+    Z = (X - mu) / sd
+    cut = max(1, int(R * 0.8))
+    beta = np.zeros(X.shape[2])
+    for _ in range(iters):
+        s = Z[:cut] @ beta; s -= s.max(1, keepdims=True)
+        p = np.exp(s); p /= p.sum(1, keepdims=True)
+        chosen = Z[:cut][np.arange(cut), winners[:cut]]
+        exp_feat = (p[:, :, None] * Z[:cut]).sum(1)
+        beta += lr * (chosen - exp_feat).mean(0)
+    def probs(Zt):
+        s = Zt @ beta; s -= s.max(1, keepdims=True)
+        p = np.exp(s); p /= p.sum(1, keepdims=True); return p
+    pte = probs(Z[cut:]); wte = winners[cut:]
+    top = pte.argmax(1); ptop = pte.max(1)
+    acc = float((top == wte).mean()) if len(wte) else 0.0
+    base = float((wte == 0).mean()) if len(wte) else 0.0
+    cal = {}
+    for b in range(3, 10):
+        m = (ptop >= b / 10) & (ptop < (b + 1) / 10)
+        if m.sum() >= 10:
+            cal[f"{b*10}-{b*10+10}%"] = round(float((top[m] == wte[m]).mean() * 100), 1)
+    # 推奨・見送りしきい値: 予測トップ確率が高いほど買い。実的中率60%超えの帯の下限を目安に。
+    thr = None
+    for b in range(3, 10):
+        key = f"{b*10}-{b*10+10}%"
+        if cal.get(key, 0) >= 60:
+            thr = round(b / 10, 2); break
+    return {
+        "beta": [round(x, 4) for x in beta.tolist()],
+        "mu": [round(x, 4) for x in mu.tolist()],
+        "sd": [round(x, 4) for x in sd.tolist()],
+        "feature_order": ["course_base", "class", "nat", "loc", "motor", "st", "ex"],
+        "test_acc": round(acc * 100, 1),
+        "baseline_course1": round(base * 100, 1),
+        "n_races": int(R),
+        "calibration": cal,
+        "suggest_buy_threshold": thr,
+    }
+
+@app.get("/api/train")
+def api_train(days: int = Query(84), step: int = Query(3), iters: int = Query(300)):
+    t0 = time.time()
+    Xs, ws, used_days = collect_dataset(days, step)
+    if len(Xs) < 200:
+        return JSONResponse({"ok": False, "error": f"データ不足（{len(Xs)}レース）。daysを増やすか開催日を確認。"}, status_code=422)
+    res = train_conditional_logit(Xs, ws, iters=iters)
+    res.update({"ok": True, "used_days": used_days, "seconds": round(time.time() - t0, 1)})
+    return res
 
 # ---- フロント（HTMLを埋め込み：別ファイル不要で確実に配信）----
 INDEX_HTML = r'''<!DOCTYPE html>
