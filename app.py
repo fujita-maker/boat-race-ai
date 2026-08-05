@@ -130,11 +130,9 @@ def fetch_exacta_odds(jcd: int, rno: int, hd: str) -> Optional[dict]:
     if len(vals) < 30:
         return None
     vals = vals[:30]
-    # boatrace.jp の2連単表は「1着1〜6の6列」を横に並べた1枚の表になっており、
-    # oddsPoint セルは行方向（各行=6列分の値）にDOM上並んでいる想定。
-    # 各列(=1着番号)内では「自分以外の艇番を昇順」で1行ずつ値が並ぶ。
-    # 誤って列方向（1着1の5個→1着2の5個…）で読むと、2個目以降が全てズレて
-    # 全く別の組み合わせのオッズを拾ってしまうため、行方向で正しく復元する。
+    # boatrace.jp の2連単表は「1着1〜6の6列」を横に並べた1枚の表で、oddsPoint セルは
+    # 行方向（各行=6列分）に並ぶ。各列(1着番号)内は「自分以外の艇番を昇順」で1行ずつ。
+    # row-major で復元する（実オッズと数値一致を確認済み）。
     seconds_by_first = {f: [s for s in range(1, 7) if s != f] for f in range(1, 7)}
     odds = {}
     idx = 0
@@ -197,13 +195,7 @@ INDEX_HTML = r'''<!DOCTYPE html>
   h2{font-size:15px;margin:2px 0 12px;color:#12263a;border-bottom:2px solid #e5ebf1;padding-bottom:6px;}
   table{border-collapse:collapse;width:100%;font-size:13px;} th,td{border:1px solid #dbe2ea;padding:5px 6px;text-align:center;}
   th{background:#eef3f8;font-weight:700;color:#33475b;} td input,td select{width:100%;border:1px solid #cfd8e3;border-radius:5px;padding:5px 4px;font-size:13px;text-align:center;background:#fbfdff;}
-  td.frame{font-weight:800;color:#fff;}
-  .chip.b1,td.frame.b1{background:#ffffff;color:#222;border:1.5px solid #b7bec6;}
-  .chip.b2,td.frame.b2{background:#1a1a1a;color:#fff;}
-  .chip.b3,td.frame.b3{background:#e6303a;color:#fff;}
-  .chip.b4,td.frame.b4{background:#1f6fd0;color:#fff;}
-  .chip.b5,td.frame.b5{background:#f4c430;color:#3a2a00;}
-  .chip.b6,td.frame.b6{background:#3aa655;color:#fff;}
+  td.frame{font-weight:800;color:#fff;} .b1{background:#e64c4c;}.b2{background:#1f6fd0;}.b3{background:#3aa655;}.b4{background:#e6a600;color:#3a2a00;}.b5{background:#2a2a2a;}.b6{background:#e6669e;}
   .oddscol{background:#fff9ec!important;}
   button{background:#1f6fd0;color:#fff;border:none;border-radius:8px;padding:10px 20px;font-size:14px;font-weight:700;cursor:pointer;}
   button:hover{background:#175bb0;} .btn2{background:#5a6b7d;font-size:13px;padding:8px 14px;}
@@ -341,33 +333,43 @@ function calc(){
  const motorN=norm(data.map(d=>d.motor)),stN=norm(data.map(d=>d.st),true),exN=norm(data.map(d=>d.ex),true),
        locN=norm(data.map(d=>d.loc)),natN=norm(data.map(d=>d.nat));
  const clsN=data.map(d=>CLASS_SCORE[d.cls]??0.33),inner=data.map(d=>(6-d.course)/5);
- // コース補正は実際の平均1着率(COURSE_BASE)をそのまま使う（min-max正規化しない）。
- // 正規化するとコース1が常に1.0になり、実力がどれだけ低くても他艇が逆転不可能になってしまうため。
+ // コース補正は実際の平均1着率(生のCOURSE_BASE)を使う（正規化しない＝1号艇が常に最大にならない）
  const cbase=data.map(d=>COURSE_BASE[d.course]??0.05);
  const quality=data.map((d,i)=>0.30*clsN[i]+0.25*natN[i]+0.20*motorN[i]+0.15*stN[i]+0.10*locN[i]);
- // 重みを実力寄りにし、実力差が大きければコース有利を覆せるようにする。
- const power=data.map((d,i)=>0.45*cbase[i]+0.55*quality[i]);
+ const power=data.map((d,i)=>0.45*cbase[i]+0.55*quality[i]);  // 実力寄り：強い外艇が頭を取れる
  const pRank=[...power.keys()].sort((a,b)=>power[b]-power[a]);
  const sel=document.getElementById('axisSel').value;
  let axisIdx=(sel==='auto')?pRank[0]:(+sel-1);
  const relGap=(power[pRank[0]]-power[pRank[1]])/power[pRank[0]];
  const axisFrame=axisIdx+1;
- // 軸→各艇の実オッズは、直取得した全30通り(lastOddsAll)から「今選ばれている軸」に対応する値を都度引く。
- // 以前は取得時点のコース1軸のオッズが固定で入っており、軸を切り替えても更新されなかった。
+ // 選択中の軸に対応する実オッズを全30通り(lastOddsAll)から都度引く（軸を変えると追従）
  const liveOdds=data.map((d,i)=>{
    if(i===axisIdx) return null;
    if(lastOddsAll){const v=lastOddsAll[`${axisFrame}-${i+1}`]; if(v!=null) return v;}
-   return d.odds; // 実オッズが引けない時だけ手入力/初期値にフォールバック
+   return d.odds;
  });
  const impl=liveOdds.map(v=>v!=null?1/v:null),implN=norm(impl,false);
  const res=data.map((d,i)=>{const J=0.40*motorN[i]+0.25*stN[i]+0.20*exN[i]+0.15*locN[i];
-   const odds_i=liveOdds[i];
-   const M=odds_i!=null?implN[i]:0.45*clsN[i]+0.35*natN[i]+0.20*inner[i];
-   return{i,frame:i+1,course:d.course,power:power[i],J,M,Y:J-M,byOdds:odds_i!=null,odds:odds_i};});
+   const oi=liveOdds[i];
+   const M=oi!=null?implN[i]:0.45*clsN[i]+0.35*natN[i]+0.20*inner[i];
+   return{i,frame:i+1,course:d.course,power:power[i],J,M,Y:J-M,byOdds:oi!=null,odds:oi};});
  const axis=res[axisIdx];
  const width=parseInt(document.getElementById('width').value);
  const cand=res.filter(r=>r.i!==axis.i).sort((a,b)=>b.Y-a.Y);
  const buys=cand.slice(0,width);const HON=0.15;
+ // ---- 期待値(EV)判定：ライブオッズがある時だけ計算 ----
+ const psum=power.reduce((a,b)=>a+b,0);
+ const p1=power.map(x=>x/psum);                       // 各艇の1着確率(暫定)
+ const others=[...Array(6).keys()].filter(i=>i!==axisIdx);
+ const osum=others.reduce((s,i)=>s+power[i],0)||1;
+ let evList=[];
+ for(const i of others){
+   const o=liveOdds[i]; if(o==null) continue;
+   const p=p1[axisIdx]*(power[i]/osum);               // P(軸=1着 かつ i=2着)
+   evList.push({frame:i+1, p, o, ev:p*o-1});
+ }
+ evList.sort((a,b)=>b.ev-a.ev);
+ const evBuys=evList.filter(e=>e.ev>0);
  const confEl=document.getElementById('conf');let cCls;const autoTop=res[pRank[0]],second=res[pRank[1]];
  if(relGap>=0.35){cCls='cHi';confEl.innerHTML=`1着信頼度：<b>高</b>（${autoTop.frame}号艇が抜けている＝堅い逃げ）`;}
  else if(relGap>=0.18){cCls='cMid';confEl.innerHTML=`1着信頼度：<b>中</b>（${autoTop.frame}号艇本命だが${second.frame}号艇と差は小さい）`;}
@@ -390,7 +392,22 @@ function calc(){
     <div><div style="margin-bottom:3px;">${tag} <span class="small">${isAxis?'頭(1着)':'2着候補'}${r.byOdds?' ・実オッズ':''}</span></div>${inner_html}</div>
     <div class="myo" style="color:${isAxis?'#5a3fb0':(r.Y>=0?'#1c7a38':'#c0392b')}">${isAxis?(r.power/maxP*100).toFixed(0):(r.Y>=0?'+':'')+(r.Y*100).toFixed(0)}</div></div>`);});
  const legs=buys.map(b=>b.frame).join('・');const combos=buys.length*4,cost=combos*100;
- document.getElementById('verdict').innerHTML=`✅ 【買い】3連単フォーメーション<br><span style="font-size:22px;">${axis.frame} → ${legs} → 全</span><br>
+ // ---- 期待値(EV)判定の表示 ----
+ let evHtml='';
+ if(evList.length){
+   const lines=evList.map(e=>`<div style="font-size:12px;padding:1px 0;">${axisFrame}-${e.frame}：オッズ${e.o.toFixed(1)} × 推定${(e.p*100).toFixed(1)}% → EV <b style="color:${e.ev>=0?'#1c7a38':'#c0392b'}">${e.ev>=0?'+':''}${(e.ev*100).toFixed(0)}%</b></div>`).join('');
+   const highOdds=evBuys.filter(e=>e.o>=15).length;
+   const rec=evBuys.length
+     ? `EV試算プラス：${evBuys.map(e=>axisFrame+'-'+e.frame).join('、')}`+(highOdds?`　⚠ <b style="color:#a02525;">高オッズ艇が含まれます＝モデルが穴を過大評価している可能性大。鵜呑み禁物。</b>`:'')
+     : `EV試算プラスの買い目なし。`;
+   evHtml=`<div style="background:#eef7ff;border:1px solid #b8d4ef;border-radius:8px;padding:10px;margin-bottom:10px;">
+     <div style="font-weight:800;color:#12263a;margin-bottom:4px;">📊 期待値(EV)の試算 ＜実験中・未較正＞</div>
+     ${lines}<div style="margin-top:5px;font-size:12.5px;">${rec}</div>
+     <div style="font-size:11px;color:#a02525;margin-top:4px;">⚠ 確率は未較正の暫定モデル。EVプラスが高オッズ艇に偏るのは「穴の過大評価」の典型で、これは買い推奨ではありません。数百件記録して較正するまでは<b>参考値</b>として見てください。</div></div>`;
+ } else {
+   evHtml=`<div style="font-size:12px;color:#9a6a10;background:#fdf3e0;border-radius:8px;padding:8px 10px;margin-bottom:10px;">📊 EV試算：ライブオッズ未取得のため計算不可（下は推定妙味による目安）。</div>`;
+ }
+ document.getElementById('verdict').innerHTML=`${evHtml}✅ 【参考】3連単フォーメーション<br><span style="font-size:22px;">${axis.frame} → ${legs} → 全</span><br>
    <span style="font-size:13px;font-weight:600;">${combos}点＝${cost.toLocaleString()}円／2連単なら「${axis.frame}-${legs}」の${buys.length}点</span>`;
  const spec=buys.filter(b=>b.Y<HON).length;const roi=document.getElementById('roiNote');
  if(cCls==='cLow')roi.innerHTML=`⚠ <b>1着信頼度が低いレース。</b>頭自体が飛ぶ危険が高いので、買う前に「勝負するか見送るか」を先に判断してください。`;

@@ -1,0 +1,12 @@
+【EV(期待値)判定を追加した更新版】
+変更点：
+ - 2連単オッズの並び順を修正（公式と数値一致を確認済み）
+ - 1着軸の重みを実力寄りに（0.45コース/0.55実力・生CB）＝1号艇に寄りすぎない
+ - オッズが選択中の軸に追従
+ - 「期待値(EV)の試算」を追加（ライブオッズ×推定確率でEVを表示）
+   ※EVは未較正の暫定モデル。高オッズ艇のEVプラスは穴の過大評価の可能性大＝買い推奨ではなく参考値。
+
+上げ方：
+ 1. GitHub の boat-race-ai で app.py を、この app.py に丸ごと置き換えて commit
+ 2. Render → Manual Deploy → Deploy latest commit
+ 3. 「Application startup complete」が出たらURLを開く
