@@ -1,15 +1,8 @@
 services:
   - type: web
-    name: boat-race-ai-v30
-    runtime: docker
-    plan: starter
+    name: boatrace-myoumi
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT
     autoDeploy: true
-    healthCheckPath: /
-    # 予想・結果データを再起動後も保持するための永続ディスク(約¥数十/月)。
-    envVars:
-      - key: APP_DATA_DIR
-        value: /var/data
-    disk:
-      name: data
-      mountPath: /var/data
-      sizeGB: 1
