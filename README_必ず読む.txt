@@ -1,12 +1,14 @@
-★このフォルダの app.py が最新・完全版です（約31KB）。
-　含まれる機能: /api/race, /api/train, /api/backtest, 学習モデル(L_BETA)
+★資金管理つき最新版（app.py 約38KB・numpy入り）。
+　古い版は約19〜28KB。GitHubで⌘F「資金管理」が出れば正解。
 
-【重要】ダウンロードフォルダに古い app.py が複数あるはずです。
-　古い版は約19KBで /api/backtest が入っていません。
-　必ず「このフォルダの app.py（31KB）」をGitHubに上げてください。
+新機能:
+ - 「④ 資金管理・実戦判定」カード追加
+ - 総資金・賭け方(固定/割合)・買いしきい値(既定80%)・1日の損切りを設定
+ - 判定結果の先頭に【買い/見送り】を自動表示（1着確率が条件以上なら
+   2連単1点[1着力1位→2位]＋賭け金、未満なら見送り）
+ - 的中/外れボタンで現在資金・本日収支・損切り残りを更新（端末に保存）
 
 手順:
- 1. GitHub の boat-race-ai で app.py を、このフォルダの app.py で上書き
- 2. Render → Manual Deploy → Deploy latest commit
- 3. 確認: https://boat-race-ai-cxwk.onrender.com/api/backtest?days=6&step=3
-    → JSON（回収率など）が返れば成功。404なら古いまま。
+ 1. ダウンロードの古いapp.pyは全部削除
+ 2. このフォルダの app.py をGitHubに上書き（⌘Fで「資金管理」が出るか確認）
+ 3. Render → Manual Deploy → Deploy latest commit

@@ -515,6 +515,31 @@ INDEX_HTML = r'''<!DOCTYPE html>
     </div>
   </div>
 
+  <div class="card">
+    <h2>④ 資金管理・実戦判定（バックテスト最適ルール）</h2>
+    <div class="controls" style="gap:16px;">
+      <span class="axisbox">💰 総資金：<input id="bank" type="number" value="30000" style="width:100px;padding:5px;border:1px solid #cfd8e3;border-radius:5px;"> 円</span>
+      <span class="axisbox">賭け方：
+        <select id="stakeMethod" onchange="if(lastData)calc()" style="padding:5px;border-radius:5px;border:1px solid #cfd8e3;">
+          <option value="fixed">固定額</option><option value="pct">資金の割合</option>
+        </select>
+        <input id="stakeFixed" type="number" value="1000" style="width:75px;padding:5px;border:1px solid #cfd8e3;border-radius:5px;" onchange="if(lastData)calc()"> 円 ／
+        <input id="stakePct" type="number" value="1" step="0.5" style="width:50px;padding:5px;border:1px solid #cfd8e3;border-radius:5px;" onchange="if(lastData)calc()"> %
+      </span>
+      <span class="axisbox">買い条件：1着確率 <input id="buyThr" type="number" value="80" style="width:50px;padding:5px;border:1px solid #cfd8e3;border-radius:5px;" onchange="if(lastData)calc()"> % 以上</span>
+      <span class="axisbox">1日の損切り：<input id="stopLoss" type="number" value="10000" style="width:80px;padding:5px;border:1px solid #cfd8e3;border-radius:5px;" onchange="renderSess()"> 円</span>
+    </div>
+    <div style="margin-top:10px;display:flex;gap:12px;align-items:center;flex-wrap:wrap;">
+      <span class="status">現在資金：<b id="curBank">—</b> 円</span>
+      <span class="status">本日収支：<b id="sessPnl">±0</b> 円</span>
+      <button class="btn2" style="background:#2e7d46;" onclick="logResult(true)">的中(配当入力)</button>
+      <button class="btn2" style="background:#a24b4b;" onclick="logResult(false)">外れ</button>
+      <button class="btn2" onclick="resetSession()">資金リセット</button>
+      <span class="small" id="stopMsg"></span>
+    </div>
+    <p class="small">資金管理は「勝ち」を作れません（回収率94.5%＝長期は負け）。役割は破産防止・損失速度の抑制・1日の損失上限。的中/外れを押すと現在資金が更新されます（この端末に保存）。</p>
+  </div>
+
   <div class="card" id="resultCard" style="display:none;">
     <h2>③ 判定結果</h2>
     <div id="conf"></div><div id="verdict"></div><div id="roiNote" class="roiNote"></div>
@@ -669,8 +694,16 @@ function calc(){
  } else {
    evHtml=`<div style="font-size:12px;color:#9a6a10;background:#fdf3e0;border-radius:8px;padding:8px 10px;margin-bottom:10px;">📊 EV試算：ライブオッズ未取得のため計算不可（下は推定妙味による目安）。</div>`;
  }
- document.getElementById('verdict').innerHTML=`${evHtml}✅ 【参考】3連単フォーメーション<br><span style="font-size:22px;">${axis.frame} → ${legs} → 全</span><br>
-   <span style="font-size:13px;font-weight:600;">${combos}点＝${cost.toLocaleString()}円／2連単なら「${axis.frame}-${legs}」の${buys.length}点</span>`;
+ // ---- 実戦判定（バックテスト最適ルール：1着確率≥しきい値 → 2連単1点[1着力1位→2位]、賭け金=資金管理）----
+ const buyThr=nz('buyThr',80), stake=calcStake();
+ const p1st=res[pRank[0]].frame, p2nd=res[pRank[1]].frame;
+ let actionHtml;
+ if(headProb>=buyThr){
+   actionHtml=`<div class="verdict" style="margin-bottom:10px;">✅ 【買い】2連単 <span style="font-size:26px;">${p1st}-${p2nd}</span> を1点／賭け金 <b>¥${stake.toLocaleString()}</b><br><span style="font-size:12px;font-weight:600;">1着確率 ${headProb.toFixed(0)}% ≥ ${buyThr}%（最適ルールの買い条件クリア。買い目＝1着力1位→2位）</span></div>`;
+ } else {
+   actionHtml=`<div class="verdict" style="margin-bottom:10px;background:#fdecec;color:#a02525;border-color:#e07272;">🚫 【見送り】1着確率 ${headProb.toFixed(0)}% ＜ ${buyThr}%（買い条件を満たさない＝賭けない）</div>`;
+ }
+ document.getElementById('verdict').innerHTML=`${actionHtml}${evHtml}<div style="opacity:.75;font-size:14px;">【参考】妙味フォーメーション：${axis.frame} → ${legs} → 全（${combos}点${cost.toLocaleString()}円）</div>`;
  const spec=buys.filter(b=>b.Y<HON).length;const roi=document.getElementById('roiNote');
  if(cCls==='cLow')roi.innerHTML=`⚠ <b>1着信頼度が低いレース。</b>頭自体が飛ぶ危険が高いので、買う前に「勝負するか見送るか」を先に判断してください。`;
  else if(spec>0)roi.innerHTML=`⚖️ 網に<b>「○投機カバー」が${spec}艇</b>（根拠薄・オッズ頼み）。的中率は上がるが回収率は75%側へ。`;
@@ -678,8 +711,40 @@ function calc(){
  document.getElementById('expl').innerHTML=`1着力順：${pRank.map(i=>res[i].frame+'号艇').join(' > ')}。頭＝${axis.frame}号艇、2着に ${legs} を流します。<br><span class="small">結果は記録シートへ。当たり外れ両方を残して通算回収率で検証を。</span>`;
  document.getElementById('resultCard').style.display='block';
 }
+// ===== 資金管理 =====
+function nz(id,d){const v=parseFloat(document.getElementById(id).value);return isNaN(v)?d:v;}
+function calcStake(){
+  const bank=nz('bank',30000);
+  if(document.getElementById('stakeMethod').value==='pct'){
+    return Math.max(100, Math.round(bank*nz('stakePct',1)/100/100)*100);
+  }
+  return Math.max(100, Math.round(nz('stakeFixed',1000)/100)*100);
+}
+function loadSess(){
+  let s={start:nz('bank',30000),cur:nz('bank',30000)};
+  try{const j=localStorage.getItem('brSess'); if(j) s=JSON.parse(j);}catch(e){}
+  return s;
+}
+function saveSess(s){try{localStorage.setItem('brSess',JSON.stringify(s));}catch(e){}}
+function renderSess(){
+  const s=loadSess();
+  document.getElementById('curBank').textContent=s.cur.toLocaleString();
+  const pnl=s.cur-s.start;
+  document.getElementById('sessPnl').textContent=(pnl>=0?'+':'')+pnl.toLocaleString();
+  const stop=nz('stopLoss',10000), msg=document.getElementById('stopMsg');
+  if(pnl<=-stop){ msg.innerHTML='🛑 <b style="color:#a02525;">損切りライン到達。今日はやめましょう。</b>'; }
+  else { msg.innerHTML=`損切りまであと ${(stop+pnl).toLocaleString()} 円`; }
+}
+function logResult(hit){
+  const s=loadSess(), stake=calcStake();
+  if(hit){ const pay=parseFloat(prompt('受け取った配当（円）を入力：','')); if(isNaN(pay))return; s.cur+=(pay-stake); }
+  else { s.cur-=stake; }
+  saveSess(s); renderSess();
+}
+function resetSession(){ const s={start:nz('bank',30000),cur:nz('bank',30000)}; saveSess(s); renderSess(); }
 initSelectors();
 buildRows([1,2,3,4,5,6].map(blankRow));
+renderSess();
 </script>
 </body>
 </html>
