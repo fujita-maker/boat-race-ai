@@ -1,0 +1,106 @@
+name: daily-autorun
+
+# 毎日自動で「予想 → 結果照合 → 台帳へ追記(永続)」を実行する。
+#  1) Renderアプリの autorun を叩く → その日の確定レースを走査し
+#     ゲート(自信度×本命の抜け)を通った 1-4 / 1-5 の高オッズ(>=20倍)EV>=1.20 を
+#     締切時オッズ+結果で即精算し、records(JSON)で返す。
+#  2) その records を リポジトリ内の data/ho_ledger.csv に追記(重複は除外)。
+#     → 台帳はGitHub側に貯まるので、Renderが再起動でディスクを消してもデータは残る。
+#  3) 通算(投資・払戻・的中率・回収率)を Actions ログに表示。
+#
+# 手動でも実行可能(Run workflow)。過去日を埋めたいときは hd に YYYYMMDD を入れる。
+
+on:
+  schedule:
+    - cron: "0 14 * * *"      # 14:00 UTC = 23:00 JST(その日の全レース終了後)
+  workflow_dispatch:
+    inputs:
+      hd:
+        description: "対象日 YYYYMMDD(空なら当日JST)"
+        required: false
+        default: ""
+
+permissions:
+  contents: write             # 台帳をコミットするため
+
+jobs:
+  autorun:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Wake Render (free plan sleeps)
+        run: |
+          BASE="https://boat-race-ai-cxwk.onrender.com"
+          curl -s -m 60 "$BASE/" -o /dev/null || true
+          sleep 20
+
+      - name: Call autorun (predict + settle)
+        run: |
+          BASE="https://boat-race-ai-cxwk.onrender.com"
+          HD="${{ github.event.inputs.hd }}"
+          URL="$BASE/api/highodds/autorun"
+          if [ -n "$HD" ]; then URL="$URL?hd=$HD"; fi
+          echo "GET $URL"
+          for i in 1 2 3; do
+            code=$(curl -s -m 300 -w '%{http_code}' -o resp.json "$URL")
+            echo "attempt $i -> HTTP $code"
+            if [ "$code" = "200" ]; then break; fi
+            sleep 30
+          done
+          test "$code" = "200"
+          echo "----- summary -----"
+          python - <<'PY'
+          import json
+          d=json.load(open("resp.json"))
+          print("hd:", d.get("hd"), " 確定レース:", d.get("確定レース"),
+                " ゲート通過:", d.get("ゲート通過"), " 今回記録:", d.get("今回記録"))
+          PY
+
+      - name: Merge records into durable ledger
+        run: |
+          python - <<'PY'
+          import json, csv, os
+          d = json.load(open("resp.json"))
+          cols = d.get("cols") or ["ts","date","jcd","rno","combo","P","odds","market_p","EV","stake","status","payout","ret","hit","star","women"]
+          recs = d.get("records") or []
+          path = "data/ho_ledger.csv"
+          os.makedirs("data", exist_ok=True)
+          rows = []
+          if os.path.exists(path):
+              with open(path, newline="", encoding="utf-8") as f:
+                  rows = list(csv.DictReader(f))
+          seen = {(r["date"], r["jcd"], r["rno"], r["combo"]) for r in rows}
+          added = 0
+          for r in recs:
+              k = (str(r["date"]), str(r["jcd"]), str(r["rno"]), str(r["combo"]))
+              if k in seen:
+                  continue
+              seen.add(k)
+              rows.append({c: r.get(c, "") for c in cols})
+              added += 1
+          rows.sort(key=lambda r: (str(r["date"]), int(r["jcd"]), int(r["rno"]), str(r["combo"])))
+          with open(path, "w", newline="", encoding="utf-8") as f:
+              w = csv.DictWriter(f, fieldnames=cols); w.writeheader(); w.writerows(rows)
+          # 通算集計
+          stk = sum(float(r["stake"]) for r in rows if r.get("status")=="settled")
+          ret = sum(float(r["ret"] or 0) for r in rows if r.get("status")=="settled")
+          n   = sum(1 for r in rows if r.get("status")=="settled")
+          h   = sum(int(float(r["hit"] or 0)) for r in rows if r.get("status")=="settled")
+          roi = (ret/stk*100) if stk else 0
+          print(f"追記 {added}行 / 台帳合計 {len(rows)}行")
+          print(f"通算: 精算{n}買い目 的中{h}({(h/n*100 if n else 0):.1f}%) "
+                f"投資{stk:,.0f}円 払戻{ret:,.0f}円 純益{ret-stk:,.0f}円 回収率{roi:.1f}%")
+          PY
+
+      - name: Commit ledger
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/ho_ledger.csv
+          if git diff --cached --quiet; then
+            echo "変更なし(新規記録なし)"
+          else
+            git commit -m "daily ledger: $(date -u +%Y-%m-%d)"
+            git push
+          fi
