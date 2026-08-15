@@ -1,0 +1,52 @@
+name: daily-autorun
+
+# 毎日「予想 → 結果照合 → 台帳追記」を GitHub 上で完結して実行する。
+#  Renderには依存しない。autorun.py が
+#   ・OpenAPI(結果) と boatrace.jp(締切時オッズ) を直接取得し、
+#   ・ゲート通過レースの 1-4/1-5・高オッズ(>=20倍)EV>=1.20 を精算して
+#   ・data/ho_ledger.csv に追記(重複除外)。
+#  台帳はGitHubに永続。通算回収率はログに表示。
+#
+# 手動実行可(Run workflow)。過去日を埋めるときは hd に YYYYMMDD。
+
+on:
+  schedule:
+    - cron: "0 14 * * *"      # 14:00 UTC = 23:00 JST(その日の全レース終了後)
+  workflow_dispatch:
+    inputs:
+      hd:
+        description: "対象日 YYYYMMDD(空なら当日JST)"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+jobs:
+  autorun:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: pip install numpy requests beautifulsoup4 lxml
+
+      - name: Run autorun (predict + settle)
+        run: |
+          python autorun.py --hd "${{ github.event.inputs.hd }}" --ledger data/ho_ledger.csv
+
+      - name: Commit ledger
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/ho_ledger.csv
+          if git diff --cached --quiet; then
+            echo "変更なし(新規記録なし)"
+          else
+            git commit -m "daily ledger: ${{ github.event.inputs.hd }}$(date -u +' %Y-%m-%d')"
+            git push
+          fi
