@@ -1,0 +1,45 @@
+name: daily-predict
+
+# 今日の未開催レースについて、両モデルの推奨買い目を data/today_picks.json に出力。
+#  predict_today.py が hit_daily.py(的中GBM)を再利用して学習・予想＋高オッズ判定を行う。
+#  1日数回走らせ、締切に近い回ほどオッズが最終値に近づく。Renderの /today が表示。
+
+on:
+  schedule:
+    # UTC 0,3,6,9 = JST 9,12,15,18 時（開催時間帯に複数回）
+    - cron: "0 0,3,6,9 * * *"
+  workflow_dispatch:
+    inputs:
+      hd:
+        description: "対象日 YYYYMMDD(空なら当日JST)"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+jobs:
+  predict:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install deps
+        run: pip install numpy scikit-learn requests beautifulsoup4 lxml
+      - name: Predict today (both models)
+        run: |
+          python predict_today.py --hd "${{ github.event.inputs.hd }}" --train-days 120 --topn 2 --out data/today_picks.json
+      - name: Commit picks
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/today_picks.json
+          if git diff --cached --quiet; then
+            echo "変更なし"
+          else
+            git pull --rebase origin main || true
+            git commit -m "today picks: ${{ github.event.inputs.hd }}$(date -u +' %H:%MZ')"
+            git push
+          fi
