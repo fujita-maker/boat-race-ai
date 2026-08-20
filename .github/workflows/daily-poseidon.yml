@@ -1,0 +1,47 @@
+name: daily-poseidon
+
+# 競艇予想AIポセイドンの『3連単120通りAI予想確率』を毎晩収集して貯める。
+#  ポセイドンは前夜23:30〜翌6:00に翌日分を掲載 → 早朝JSTに当日ぶんを取得。
+#  データは過去に遡れないので、ここから毎日ためるのが全ての土台。
+#  収集: data/poseidon/{YYYYMMDD}.json に AI予想確率(全120組)を保存。
+#
+# 手動実行可(Run workflow)。hd に YYYYMMDD で任意日。
+
+on:
+  schedule:
+    - cron: "30 16 * * *"      # 16:30 UTC = 01:30 JST(ポセイドン掲載後)
+  workflow_dispatch:
+    inputs:
+      hd:
+        description: "対象日 YYYYMMDD(空なら当日JST)"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install deps
+        run: pip install requests
+      - name: Scrape Poseidon AI probabilities
+        run: |
+          python poseidon_scrape.py --hd "${{ github.event.inputs.hd }}" --out data/poseidon
+      - name: Commit
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git pull --rebase --autostash || true
+          git add data/poseidon
+          if git diff --cached --quiet; then
+            echo "変更なし"
+          else
+            git commit -m "poseidon AI probs: ${{ github.event.inputs.hd }}$(date -u +' %Y-%m-%d')"
+            git push
+          fi
