@@ -1,0 +1,62 @@
+name: daily-poseidon-grade
+
+# レース後に「ポセイドンを最終オッズ込みで再取得 → 1号艇軸+高オッズ+EVプラスで6-8点選定 → 実結果で精算」。
+#  data/poseidon/{hd}.json を更新し、data/poseidon_ledger.csv に通算成績を追記。
+#  手動実行で過去日(例 20260820)も採点可 → 完了日で初回結果が見られる。
+
+on:
+  schedule:
+    - cron: "40 14 * * *"      # 14:40 UTC = 23:40 JST(全レース終了後)
+  workflow_dispatch:
+    inputs:
+      hd:
+        description: "対象日 YYYYMMDD(空なら当日JST)"
+        required: false
+        default: ""
+      odds_min:
+        description: "高オッズ足切り(既定20)"
+        required: false
+        default: "20"
+      ev_min:
+        description: "EV下限(既定1.0)"
+        required: false
+        default: "1.0"
+      points:
+        description: "1レース最大点数(既定8)"
+        required: false
+        default: "8"
+
+permissions:
+  contents: write
+
+jobs:
+  grade:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install deps
+        run: pip install requests numpy beautifulsoup4 lxml
+      - name: Re-scrape with final odds
+        run: python poseidon_scrape.py --hd "${{ github.event.inputs.hd }}" --out data/poseidon
+      - name: Grade (1号艇軸+高オッズ+EV)
+        run: |
+          python poseidon_grade.py --hd "${{ github.event.inputs.hd }}" \
+            --ledger data/poseidon_ledger.csv \
+            --odds-min "${{ github.event.inputs.odds_min || '20' }}" \
+            --ev-min "${{ github.event.inputs.ev_min || '1.0' }}" \
+            --points "${{ github.event.inputs.points || '8' }}"
+      - name: Commit
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git pull --rebase --autostash || true
+          git add data/poseidon data/poseidon_ledger.csv
+          if git diff --cached --quiet; then
+            echo "変更なし"
+          else
+            git commit -m "poseidon grade: ${{ github.event.inputs.hd }}$(date -u +' %Y-%m-%d')"
+            git push
+          fi
