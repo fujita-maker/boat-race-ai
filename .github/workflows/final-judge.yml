@@ -1,0 +1,50 @@
+name: final-judge
+
+# 締切5分前(実際は締切まで3〜13分=約5〜10分前)の最終判定を全24場で自動実行。
+#  predict_final.py が該当レースだけ最新データ+3連単オッズで再計算 → 買い/見送りを確定し
+#  data/tri_hit_ledger.csv に固定保存(上書き禁止) + 確定レースを自動精算。
+#  app.py の /final(カード表示)がこの台帳を読む。
+
+on:
+  schedule:
+    # 毎時00分(GitHubが最も混む)を避け、:05,:15,…の10分毎で発火率を上げる。
+    # UTC 0-13 = JST 9:00〜22:59（開催時間帯を広めにカバー）
+    - cron: "5,15,25,35,45,55 0-13 * * *"
+  workflow_dispatch:
+    inputs:
+      hd:
+        description: "対象日 YYYYMMDD(空なら当日JST)"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+concurrency:
+  group: final-judge
+  cancel-in-progress: false
+
+jobs:
+  judge:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install deps
+        run: pip install fastapi numpy requests beautifulsoup4 lxml
+      - name: Final judge (near-deadline window)
+        run: python predict_final.py --hd "${{ github.event.inputs.hd }}"
+      - name: Commit ledger
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/tri_hit_ledger.csv
+          if git diff --cached --quiet; then
+            echo "変更なし"
+          else
+            git pull --rebase origin main || true
+            git commit -m "final-judge: $(date -u +'%Y%m%d %H:%MZ')"
+            git push
+          fi
