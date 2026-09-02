@@ -1,0 +1,57 @@
+name: commit-tri-ledger
+
+# RenderのAI台帳(tri_hit_ledger.csv, uv_json入り)を毎日GitHubへ保存する。
+# これで uv40 / uv55 / uv_stable / kp6 / kp7 のレース単位データが常にリポジトリに残り、
+# 詳細分析(keyp帯別・オッズ帯別・月別など)をいつでも回せる。
+
+on:
+  schedule:
+    - cron: "30 14 * * *"   # 毎日 23:30 JST（当日レースがほぼ確定した後）
+  workflow_dispatch: {}      # 手動実行も可
+
+permissions:
+  contents: write            # data/ にコミット＆pushするため
+
+concurrency:
+  group: commit-tri-ledger
+  cancel-in-progress: false
+
+jobs:
+  commit:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Fetch ledger from Render
+        run: |
+          mkdir -p data
+          # 失敗しても既存ファイルを壊さないよう一時ファイルへ取得
+          if curl -sSf --max-time 90 \
+               "https://boat-race-ai-cxwk.onrender.com/api/tri/ledger.csv" \
+               -o data/tri_hit_ledger.csv.new; then
+            # ヘッダ行以外に最低1行あるときだけ差し替え（空応答で上書きしない）
+            lines=$(wc -l < data/tri_hit_ledger.csv.new)
+            if [ "$lines" -ge 2 ]; then
+              mv data/tri_hit_ledger.csv.new data/tri_hit_ledger.csv
+              echo "updated: $((lines - 1)) rows"
+            else
+              echo "empty ledger returned ($lines lines) - skip replace"
+              rm -f data/tri_hit_ledger.csv.new
+            fi
+          else
+            echo "fetch failed (Render sleeping or error) - keep existing file"
+            rm -f data/tri_hit_ledger.csv.new
+          fi
+
+      - name: Commit if changed
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/tri_hit_ledger.csv
+          if git diff --staged --quiet; then
+            echo "no change - nothing to commit"
+          else
+            git commit -m "chore: update tri_hit_ledger.csv (auto)"
+            git push
+          fi
