@@ -1,0 +1,55 @@
+name: commit-ho-ledger
+
+# Renderの高オッズEV常駐台帳(ho_live_ledger.csv)を毎日GitHubへ保存する。
+# 高オッズ(2連単)の結果がレース単位で永続化され、通算回収率の検証・分析をいつでも回せる。
+# GitHubのcron(daily-autorun)に依存せず、記録自体はRender常駐スケジューラが行う。
+
+on:
+  schedule:
+    - cron: "35 14 * * *"   # 毎日 23:35 JST（当日レースがほぼ確定した後）
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: commit-ho-ledger
+  cancel-in-progress: false
+
+jobs:
+  commit:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Fetch ledger from Render
+        run: |
+          mkdir -p data
+          if curl -sSf --max-time 90 \
+               "https://boat-race-ai-cxwk.onrender.com/api/highodds/live_ledger.csv" \
+               -o data/ho_live_ledger.csv.new; then
+            lines=$(wc -l < data/ho_live_ledger.csv.new)
+            if [ "$lines" -ge 2 ]; then
+              mv data/ho_live_ledger.csv.new data/ho_live_ledger.csv
+              echo "updated: $((lines - 1)) rows"
+            else
+              echo "empty ledger returned ($lines lines) - skip replace"
+              rm -f data/ho_live_ledger.csv.new
+            fi
+          else
+            echo "fetch failed (Render sleeping or error) - keep existing file"
+            rm -f data/ho_live_ledger.csv.new
+          fi
+
+      - name: Commit if changed
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/ho_live_ledger.csv
+          if git diff --staged --quiet; then
+            echo "no change - nothing to commit"
+          else
+            git commit -m "chore: update ho_live_ledger.csv (auto)"
+            git push
+          fi
