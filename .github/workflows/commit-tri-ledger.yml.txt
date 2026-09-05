@@ -1,0 +1,68 @@
+name: commit-tri-ledger
+
+# RenderのAI台帳(uv_json入り)を毎日GitHubへ保存する。
+# これで uv40 / uv55 / uv_stable / kp6 / kp7 / rare のレース単位データが常にリポジトリに残り、
+# 詳細分析(keyp帯別・オッズ帯別・月別など)をいつでも回せる。
+#
+# 保存先は data/tri_render_ledger.csv（2026-09-06 変更）。
+#   旧: data/tri_hit_ledger.csv に保存していたが、final-judge.yml が同じパスへ
+#   開催時間帯に10分おきに書き込むため、23:30に保存したuv入り台帳が翌日必ず
+#   上書きされて消えていた。ファイル名を分離して衝突を解消する。
+#   final-judge.yml 側(uv列なし)は data/tri_hit_ledger.csv のまま変更しない。
+
+on:
+  schedule:
+    - cron: "30 14 * * *"   # 毎日 23:30 JST（当日レースがほぼ確定した後）
+  workflow_dispatch: {}      # 手動実行も可
+
+permissions:
+  contents: write            # data/ にコミット＆pushするため
+
+concurrency:
+  group: commit-tri-ledger
+  cancel-in-progress: false
+
+jobs:
+  commit:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Fetch ledger from Render
+        run: |
+          mkdir -p data
+          # 失敗しても既存ファイルを壊さないよう一時ファイルへ取得
+          if curl -sSf --max-time 90 \
+               "https://boat-race-ai-cxwk.onrender.com/api/tri/ledger.csv" \
+               -o data/tri_render_ledger.csv.new; then
+            # ヘッダ行以外に最低1行あるときだけ差し替え（空応答で上書きしない）
+            lines=$(wc -l < data/tri_render_ledger.csv.new)
+            if [ "$lines" -lt 2 ]; then
+              echo "empty ledger returned ($lines lines) - skip replace"
+              rm -f data/tri_render_ledger.csv.new
+            elif ! head -1 data/tri_render_ledger.csv.new | grep -q "uv_json"; then
+              # uv_json列が無い応答は別モデルの台帳＝保存する意味がないので弾く
+              echo "header has no uv_json - wrong ledger format, skip replace"
+              head -1 data/tri_render_ledger.csv.new
+              rm -f data/tri_render_ledger.csv.new
+            else
+              mv data/tri_render_ledger.csv.new data/tri_render_ledger.csv
+              echo "updated: $((lines - 1)) rows"
+            fi
+          else
+            echo "fetch failed (Render sleeping or error) - keep existing file"
+            rm -f data/tri_render_ledger.csv.new
+          fi
+
+      - name: Commit if changed
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/tri_render_ledger.csv
+          if git diff --staged --quiet; then
+            echo "no change - nothing to commit"
+          else
+            git commit -m "chore: update tri_render_ledger.csv (auto)"
+            git push
+          fi
