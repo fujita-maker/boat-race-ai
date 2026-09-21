@@ -1532,6 +1532,23 @@ def _midev_line(uv):
         int(_MIDEV_LO), int(_MIDEV_HI), _MIDEV_EV, len(pk), _MIDEV_UNIT, body, tail, tags)
 
 
+def _fplan_line(uv):
+    """v100: F案(改良モデル×市場の合成EV)の1行。買い目が立った時だけ出す。"""
+    fv = (uv or {}).get("fplan") or {}
+    pk = fv.get("picks") or []
+    if not pk:
+        return ""
+    body = " / ".join('<span class="combo">%s</span>(%s倍・合成EV%.2f)' % (p.get("combo"), p.get("odds"), _fnum(p.get("ev")))
+                      for p in pk)
+    tail = ""
+    if fv.get("hit") is not None and str(fv.get("hit")) != "":
+        tail = ('　<span class="res-hit">的中（払戻%s円）</span>' % f"{int(_fnum(fv.get('ret'))):,}"
+                if str(fv.get("hit")) == "1" else '　<span class="res-miss">不的中</span>')
+    return ('<div class="tsub" style="margin-top:2px"><b style="color:%s">F案%s</b>'
+            '<span style="color:#8a97a5">（改良モデル×市場の合成EV&ge;%.2f・%d点×%s円）</span>　%s%s</div>') % (
+        _F_COLOR, (" 買い" if _F_LIVE else "（記録のみ）"), _F_EV, len(pk), f"{_F_UNIT:,}", body, tail)
+
+
 def _form_line(uv):
     """v95: E案フォーメーションの1行。買いのときは緑で買い目を出す。"""
     gv = (uv or {}).get("form") or {}
@@ -2365,6 +2382,171 @@ def bestroi_pick(boats, odds_map):
             "reason": (f"{int(_DROI_LO)}〜{int(_DROI_HI)}倍で較正EV≥{_DROI_EV}の較正EV上位{len(picks)}点(D案・1点{_DROI_UNIT}円)。")}
 
 
+# ============ v100(2026-09-21 藤田指示「混ぜた確率でEV≥1.00を実践で行く」): F案＝改良モデル×市場の合成EV ============
+#   背景: 今のモデル(predict_power→Plackett-Luce)は「1着の強さ」を2着・3着に使い回すため、
+#     2着・3着で本命(特に1コース)を大きく過大評価していた(2026/1〜9・40,692R実測:
+#     1コースの2着 予測58.5%→実際38.1%、3着 64.8%→31.8%)。
+#   改良モデル: 着順ごとに別の式(条件付きロジット)で、今のスコア＋コース別補正＋12要素。
+#     学習 1/1〜5/31(23,127R)・検証 6/1〜9/20(17,565R)で、実際の結果に付ける確率が今のモデルの×1.22。
+#   合成: 市場の確率(3連単オッズの逆数を正規化)と対数で重み付け合成。重みは 8/20〜9/4 の最終オッズで決定
+#     (改良モデル0.205 / 市場0.853)。検証 9/5〜9/20 でも崩れず。
+#   買い方: 10〜150倍 かつ 合成EV(合成確率×オッズ)≥1.00 の組を全部、1点1,000円。点数の上限なし。
+#     最終オッズでの32日実測: 1,271点(1日約40点)・的中41・回収率195.2%(前半184%/後半244%)・95%区間87〜248%。
+#   ⚠ 検証は「最終オッズ」。実際は締切5〜10分前のオッズで判定する。判定時オッズでの検証は
+#     commit-odds3t.yml で data/odds3t/ に貯めてから行う。係数はここに固定(学習し直すときは丸ごと差し替える)。
+#   A〜E案の判定には使っていない(それらは今のモデルで条件を調整してきたため)。
+#   詳細は project doc [[boat-race-model-upgrade-results-0921]]。
+_F_NEW = ["nat2", "nat3", "loc3", "mot3", "boat2", "avgst", "ex_rel", "st_rel", "fl", "age", "wt", "cls"]
+_F_ZP = {"nat2": [33.014976, 13.916647], "nat3": [49.661723, 16.718355], "loc3": [44.407578, 24.814433], "mot3": [47.987748, 15.613981], "boat2": [31.973989, 10.954146], "avgst": [0.160273, 0.030005], "ex_rel": [0.0, 0.051446], "st_rel": [-0.0, 0.081788], "fl": [0.145436, 0.362577], "age": [38.972983, 10.711521], "wt": [52.06638, 2.711014], "cls": [0.548594, 0.307498]}
+_F_W = {
+    1: [1.119728, 0.378347, 0.468870, 0.381099, 0.047261, -0.708148, 0.089964, -0.294929, 0.056549, -0.047882, 0.020134, -0.129659, -0.017598, -0.038043, -0.062511, -0.090141, 0.024366, -0.021794],
+    2: [0.994770, 1.228571, 1.175194, 0.934527, 0.808832, 0.396147, -0.143609, -0.063505, 0.042820, -0.063621, 0.006910, -0.054353, 0.047410, -0.019946, -0.037072, -0.001717, 0.053080, -0.015217],
+    3: [0.985629, 1.514337, 1.605853, 1.555598, 1.537601, 1.394488, -0.344109, 0.133104, 0.041327, -0.058322, 0.002869, -0.020649, 0.083621, -0.016039, -0.030364, -0.005353, 0.026958, -0.023572],
+}   # 並び: [今のスコア(log P1着), 2〜6コース(1コース基準), *_F_NEW]
+_F_BLEND = (0.205022, 0.853015)   # (改良モデル, 市場)
+_F_LO, _F_HI = 10.0, 150.0
+_F_EV = 1.00
+_F_UNIT = 1000
+# ⚠ 2026-09-21 検証のやり直しで、上の「195.2%」は 8/28・8/29 の壊れたオッズファイル(保存オッズが実払戻の約1.3倍)に
+#   依存していたと判明。2日を除き実払戻で精算すると 30日 124.3%(前半7.3%/後半244.4%・95%区間47〜225%)、
+#   合成の重みを決め直すと改良モデル0.057/市場0.991＝市場に上乗せできる情報はほぼ無い。
+#   よって F案は「記録のみ」で開始し、判定時オッズで前向きに確かめる。実弾にするときは True にするだけ。
+_F_LIVE = False
+_F_CLS = {"A1": 1.0, "A2": 0.66, "B1": 0.33, "B2": 0.0}
+_F_COLOR = "#0b5cad"     # 濃い青（文字・枠線）
+_F_BG = "#eef5fc"        # 薄い青（背景）
+
+
+def _f_nan(v):
+    try:
+        f = float(v)
+        return f if f == f else float("nan")
+    except (TypeError, ValueError):
+        return float("nan")
+
+
+def f_model_probs(rc, boats):
+    """v100: 改良モデルの3連単120通り確率 {"i-j-k": p}。取れなければ None。"""
+    try:
+        entries = []
+        _collect_with_key(rc, "national_win_rate", entries)
+        ent = {int(e.get("entry_number", 0)): e for e in entries if e.get("entry_number")}
+        prevs = []
+        _collect_with_key(rc, "exhibition_time", prevs)
+        prv = {int(p.get("entry_number", 0)): p for p in prevs if p.get("entry_number")}
+        power = predict_power(boats)
+        bf = {b["frame"]: b for b in boats}
+        if len(bf) != 6 or len(ent) < 6:
+            return None
+        raw = {k: [] for k in _F_NEW}
+        for n in range(1, 7):
+            e = ent.get(n, {}); p = prv.get(n, {})
+            st = p.get("start_timing")
+            if st is None:
+                st = e.get("average_start_timing")
+            raw["nat2"].append(_f_nan(e.get("national_top_2_percent")))
+            raw["nat3"].append(_f_nan(e.get("national_top_3_percent")))
+            raw["loc3"].append(_f_nan(e.get("local_top_3_percent")))
+            raw["mot3"].append(_f_nan(e.get("motor_top_3_percent")))
+            raw["boat2"].append(_f_nan(e.get("boat_top_2_percent")))
+            raw["avgst"].append(_f_nan(e.get("average_start_timing")))
+            raw["ex_rel"].append(_f_nan(p.get("exhibition_time")))
+            raw["st_rel"].append(_f_nan(st))
+            raw["fl"].append(_f_nan(e.get("flying_count")))
+            raw["age"].append(_f_nan(e.get("age")))
+            raw["wt"].append(_f_nan(e.get("weight")))
+            raw["cls"].append(_F_CLS.get(e.get("rank_number_source") or "B1", 0.33))
+        for k in ("ex_rel", "st_rel"):      # レース内の平均との差にする(場ごとの水準差を消す)
+            vals = [v for v in raw[k] if v == v]
+            m = (sum(vals) / len(vals)) if vals else 0.0
+            raw[k] = [(v - m) if v == v else float("nan") for v in raw[k]]
+        X = []
+        for i, n in enumerate(range(1, 7)):
+            c = int(bf[n].get("course") or n)
+            row = [float(np.log(max(power.get(n, 0.0), 1e-12)))]
+            row += [1.0 if c == cc else 0.0 for cc in range(2, 7)]
+            for k in _F_NEW:
+                v = raw[k][i]; mu, sd = _F_ZP[k]
+                row.append(((v - mu) / sd) if v == v else 0.0)
+            X.append(row)
+        X = np.asarray(X)
+        U = {s: X @ np.asarray(_F_W[s]) for s in (1, 2, 3)}
+
+        def _sm(u, excl):
+            m = np.array([k not in excl for k in range(6)])
+            e = np.exp(u - u[m].max()) * m
+            return e / e.sum()
+        p1 = _sm(U[1], ())
+        out = {}
+        for a in range(6):
+            p2 = _sm(U[2], (a,))
+            for b in range(6):
+                if b == a:
+                    continue
+                p3 = _sm(U[3], (a, b))
+                for c in range(6):
+                    if c in (a, b):
+                        continue
+                    out[f"{a+1}-{b+1}-{c+1}"] = float(p1[a] * p2[b] * p3[c])
+        s = sum(out.values()) or 1.0
+        return {k: v / s for k, v in out.items()}
+    except Exception as _e:
+        print("[F案] model error", _e, flush=True)
+        return None
+
+
+def _f_safe(rc, boats, odds_map):
+    """F案で例外が出ても uv_json 全体(A〜E案の記録)を巻き込まないための包み。"""
+    try:
+        return f_pick(rc, boats, odds_map)
+    except Exception as _e:
+        print("[F案] pick error", _e, flush=True)
+        return {"decision": "見送り", "picks": [], "total": 0, "reason": "F案の計算でエラー"}
+
+
+def f_pick(rc, boats, odds_map):
+    """v100 F案(実弾): 改良モデル×市場の合成確率で、10〜150倍かつ合成EV≥1.00の組を全部。1点1,000円。"""
+    if not odds_map:
+        return {"decision": "見送り", "picks": [], "total": 0, "reason": "オッズ未取得"}
+    pm = f_model_probs(rc, boats)
+    if not pm:
+        return {"decision": "見送り", "picks": [], "total": 0, "reason": "改良モデルの計算に必要なデータが不足"}
+    od = {}
+    for k in pm:
+        try:
+            o = float(odds_map.get(k) or 0)
+        except (TypeError, ValueError):
+            o = 0.0
+        od[k] = o
+    inv = {k: (1.0 / o if o > 0 else 0.0) for k, o in od.items()}
+    zq = sum(inv.values())
+    if zq <= 0 or sum(1 for o in od.values() if o > 0) < 100:
+        return {"decision": "見送り", "picks": [], "total": 0, "reason": "オッズ板が不完全"}
+    a, b = _F_BLEND
+    lp = {k: a * np.log(pm[k] + 1e-12) + b * np.log(inv[k] / zq + 1e-12) for k in pm}
+    mx = max(lp.values())
+    ex = {k: float(np.exp(v - mx)) for k, v in lp.items()}
+    ze = sum(ex.values())
+    cands = []
+    for k, e in ex.items():
+        o = od[k]
+        if not (_F_LO <= o <= _F_HI):
+            continue
+        pb = e / ze
+        ev = pb * o
+        if ev < _F_EV:
+            continue
+        cands.append({"combo": k, "Pb": round(pb, 5), "Pm": round(pm[k], 5), "Pq": round(inv[k] / zq, 5),
+                      "odds": o, "ev": round(ev, 3), "stake": _F_UNIT})
+    cands.sort(key=lambda x: x["ev"], reverse=True)
+    if not cands:
+        return {"decision": "見送り", "picks": [], "total": 0,
+                "reason": f"{int(_F_LO)}〜{int(_F_HI)}倍で合成EV≥{_F_EV:.2f}の組が無いため見送り。"}
+    return {"decision": "買い", "picks": cands, "total": _F_UNIT * len(cands),
+            "reason": (f"改良モデル×市場の合成確率で {int(_F_LO)}〜{int(_F_HI)}倍かつ合成EV≥{_F_EV:.2f} の"
+                       f"{len(cands)}点(F案・1点{_F_UNIT}円)。")}
+
+
 # v92(2026-09-20 藤田指示「検証用に表示したい」): 仮説H2を記録のみバケットとして追加。
 #   仮説「外枠の強いキー艇(N)が3着以内に入らないとき、その内隣(N-1)が2着に入る」
 #   発端: 2026-09-20 尼崎7R(4号艇A1・最上位2連率だが着外 → 結果1-3-2)。
@@ -2996,6 +3178,24 @@ def final_page():
         return {"buy": buy, "hits": hits, "bset": bset, "stake": stake, "ret": ret,
                 "skip": skip, "roi": (ret / stake * 100) if stake else 0}
 
+    def _fplan_stats():
+        """v100: F案(改良モデル×市場の合成EV≥1.00・10〜150倍)の当日集計。"""
+        buy = hits = bset = skip = 0; stake = 0.0; ret = 0.0
+        for r, u in uv_today:
+            fv = (u or {}).get("fplan") or {}
+            if not fv:
+                continue
+            if not fv.get("picks"):
+                skip += 1; continue
+            buy += 1
+            if r.get("status") == "settled":
+                bset += 1
+                stake += sum((p.get("stake", 0) or 0) for p in fv["picks"])
+                hits += 1 if fv.get("hit") else 0
+                ret += fnum(fv.get("ret"))
+        return {"buy": buy, "hits": hits, "bset": bset, "stake": stake, "ret": ret,
+                "skip": skip, "roi": (ret / stake * 100) if stake else 0}
+
     def _h2_stats():
         """v92: 仮説H2の当日集計。記録のみ。"""
         buy = hits = bset = skip = 0; stake = 0.0; ret = 0.0
@@ -3284,6 +3484,7 @@ def final_page():
                          _form_stats(True), live=True, color=_FORM_COLOR)
                + _uv_row("D案：10〜15倍×較正EV&ge;1.2 の較正EV上位3点（1点%d円＝最大%d円・検証中）"
                          % (_DROI_UNIT, _DROI_UNIT * _DROI_N), _droi_stats(), live=True)
+               + (_uv_row("F案：改良モデル×市場の合成EV&ge;%.2f・%d〜%d倍の組を全部（1点%d円）%s" % (_F_EV, int(_F_LO), int(_F_HI), _F_UNIT, "" if _F_LIVE else "・記録のみ"), _fplan_stats(), live=_F_LIVE, color=_F_COLOR) if _F_LIVE else "")
                + '<div class="tsub" style="margin-top:8px">'
                  'A案・B案（過小評価キー）・C案（中オッズEV）・D案（低中オッズ較正EV）を並行してライブ検証中。'
                  'A案とB案は<b>同じ買い目</b>なので、両方に「買い」が出ても買うのは1回分。'
@@ -3298,7 +3499,8 @@ def final_page():
                  '<br>下の「記録のみ」は<b>買いません</b>。</div></div>')
     uv_shadow = ('<div class="fcard" style="border-color:#dbe2ea">'
                  '<div style="font-weight:700;color:#5c6b7a;font-size:15px">'
-                 '&#128203; 記録のみのバケット（買わない・検証用）　%d件</div>' % (35 if _MIDEV_DISPLAY else 31 + len(_MIDEV_SHADOWS))
+                 '&#128203; 記録のみのバケット（買わない・検証用）　%d件</div>' % ((35 if _MIDEV_DISPLAY else 31 + len(_MIDEV_SHADOWS)) + (0 if _F_LIVE else 1))
+                 + ("" if _F_LIVE else _uv_row("F案：改良モデル×市場の合成EV&ge;%.2f・%d〜%d倍の組を全部（1点%d円）%s" % (_F_EV, int(_F_LO), int(_F_HI), _F_UNIT, "" if _F_LIVE else "・記録のみ"), _fplan_stats(), live=_F_LIVE, color=_F_COLOR))
                  + _uv_row("≥40混戦＋1号艇展示良好（B案改良案）", uv40_ex)
                  + _uv_row("≥40混戦＋穏やか水面 波&lt;4cm（B案改良案2）", uv40_calm)
                  + _uv_row("≥40混戦＋期待値ev&ge;1.2", uv40_ev12)
@@ -3456,7 +3658,9 @@ def final_page():
         _rarebuy = _rare10 or _rare20
         _rarelab = "波乱≤10%" if _rare10 else ("波乱≤20%" if _rare20 else None)
         _dpk = (uv.get("droi") or {}).get("picks") or []   # v78: D案(並行検証)
-        _plans = [lab for ok, lab in ((_planA, "A案"), (_planB, "B案"), (bool(_cpk), "C案"), (bool(_dpk), "D案")) if ok]
+        _fpk = ((uv.get("fplan") or {}).get("picks") or []) if _F_LIVE else []   # v100: F案(実弾のときだけ)
+        _plans = [lab for ok, lab in ((_planA, "A案"), (_planB, "B案"), (bool(_cpk), "C案"), (bool(_dpk), "D案"),
+                                      (bool(_fpk), "F案")) if ok]
         if _rarebuy:
             _plans.append(_rarelab)
         isbuy = bool(_plans)
@@ -3490,6 +3694,12 @@ def final_page():
                 pay = (fnum(o) * stk) if (o is not None and stk) else None
                 h += '<tr><td>D案</td><td class="combo">%s</td><td>%s</td><td>%s円</td><td>%s</td></tr>' % (
                     p.get("combo"), (str(o) + "倍" if o is not None else "—"),
+                    f"{int(stk):,}", (f"{int(pay):,}円" if pay else "—"))
+            for p in _fpk:
+                o = p.get("odds"); stk = fnum(p.get("stake")); _tot += stk
+                pay = (fnum(o) * stk) if (o is not None and stk) else None
+                h += '<tr><td style="color:%s;font-weight:700">F案</td><td class="combo">%s</td><td>%s</td><td>%s円</td><td>%s</td></tr>' % (
+                    _F_COLOR, p.get("combo"), (str(o) + "倍" if o is not None else "—"),
                     f"{int(stk):,}", (f"{int(pay):,}円" if pay else "—"))
             if _rarebuy:
                 _rpk = _rarebuy.get("picks", [])
@@ -3590,7 +3800,7 @@ def final_page():
             h += ('<div style="background:#fff8e6;border:1px solid #f0e2b8;border-radius:10px;padding:8px 10px;margin-top:8px;font-size:13px">'
                   '%s%s%s%s%s%s%s%s</div>') % (badge, inner, _lane_line(uv), _lane_real_line(uv),
                                           _fav_line(r), _form_line(uv), _mkt1_line(uv),
-                                          _midev_line(uv))
+                                          _midev_line(uv) + _fplan_line(uv))
         # 結果（v73: 別モデル(的中率重視)の的中/研究は出さず、実際に買いになった案だけ）
         if r.get("status") == "settled" and r.get("win_combo"):
             win = r.get("win_combo")
@@ -3629,6 +3839,15 @@ def final_page():
                             win, hpd.get("odds"), f"{int(fnum(dvd.get('ret'))):,}"))
                     else:
                         parts.append('<span class="res-miss">D案 不的中</span>')
+                # v100: F案(実弾のときだけ結果行に出す。記録のみのときはカード内の行に出る)
+                fvd = uv.get("fplan") or {}
+                if _F_LIVE and fvd.get("picks"):
+                    hpf = next((p for p in fvd["picks"] if p.get("combo") == win), None)
+                    if str(fvd.get("hit")) == "1" and hpf:
+                        parts.append('<span class="res-hit">F案 %s 的中(%s倍) 払戻%s円</span>' % (
+                            win, hpf.get("odds"), f"{int(fnum(fvd.get('ret'))):,}"))
+                    else:
+                        parts.append('<span class="res-miss">F案 不的中</span>')
                 # v77: 波乱の目フォメ(展示3位以下で買った分)。≤10%と≤20%は同一買いなので1回だけ表示。
                 for _f, _lab in (("rare", "波乱≤10%"), ("rare20", "波乱≤20%")):
                     _rr = uv.get(_f) or {}
@@ -4806,6 +5025,7 @@ def tri_judge_cycle():
                                           "rare20": _rare_upset_pick(rc, thr=20.0),
                                           "midev": _midev_with_cap(rows, hd, boats, odds_map),
                                           "droi": bestroi_pick(boats, odds_map),
+                                          "fplan": _f_safe(rc, boats, odds_map),
                                           "h2": h2_pick(uv, odds_map),
                                           "form": formation_pick(boats, odds_map),
                                           "mkt1": mkt1_view(boats, odds_map),
@@ -4886,6 +5106,14 @@ def tri_judge_cycle():
                     if p.get("combo") == win_combo:
                         dhit = 1; dret += (p.get("stake", 0) or 0) * (pay / 100.0)
                 dv["hit"] = dhit; dv["ret"] = int(dret); uv["droi"] = dv
+            # v100: F案(改良モデル×市場の合成EV)の精算
+            fv = uv.get("fplan") or {}
+            if fv.get("picks"):
+                fhit = 0; fret = 0.0
+                for p in fv["picks"]:
+                    if p.get("combo") == win_combo:
+                        fhit = 1; fret += (p.get("stake", 0) or 0) * (pay / 100.0)
+                fv["hit"] = fhit; fv["ret"] = int(fret); uv["fplan"] = fv
             # v92: 仮説H2の精算(記録のみ)
             hv = uv.get("h2") or {}
             if hv.get("flag") and hv.get("picks"):
@@ -5484,6 +5712,22 @@ def api_tri_summary():
         return {"buy": buy, "hits": hits, "stake": int(stake), "ret": int(ret),
                 "roi": round(ret / stake * 100, 1) if stake else 0}
 
+    def agg_fplan(rs):
+        buy = hits = 0; stake = 0.0; ret = 0.0
+        for r in rs:
+            try:
+                u = json.loads(r.get("uv_json") or "{}")
+            except Exception:
+                u = {}
+            d = u.get("fplan") or {}
+            if d.get("picks") and r.get("status") == "settled":
+                buy += 1
+                stake += sum((p.get("stake", 0) or 0) for p in d["picks"])
+                hits += 1 if d.get("hit") else 0
+                ret += fnum(d.get("ret"))
+        return {"buy": buy, "hits": hits, "stake": int(stake), "ret": int(ret),
+                "roi": round(ret / stake * 100, 1) if stake else 0, "live": _F_LIVE}
+
     def agg_droi(rs):
         buy = hits = 0; stake = 0.0; ret = 0.0
         for r in rs:
@@ -5538,7 +5782,7 @@ def api_tri_summary():
                       "midev_favlo": agg_midev(today, "midev_favlo"),
                       "midev_favhi": agg_midev(today, "midev_favhi"),
                       "uvfav": {nm: agg_uvfav(today, fl, lo, hi) for nm, _, fl, lo, hi in _UVFAV_FILTERS},
-                      "droi": agg_droi(today)},
+                      "droi": agg_droi(today), "fplan": agg_fplan(today)},
             "cumulative": {"hit": agg_hit(rows), "uv40": agg_uv(rows, "dec40"), "uv55": agg_uv(rows, "dec55"),
                            "uv_stable": agg_uv(rows, "dec_stable"), "uv_stable_stop": agg_uv_stop(rows),
                            "rare_upset": agg_rare(rows),
@@ -5574,7 +5818,7 @@ def api_tri_summary():
                            "midev_favlo": agg_midev(rows, "midev_favlo"),
                            "midev_favhi": agg_midev(rows, "midev_favhi"),
                            "uvfav": {nm: agg_uvfav(rows, fl, lo, hi) for nm, _, fl, lo, hi in _UVFAV_FILTERS},
-                           "droi": agg_droi(rows)}}
+                           "droi": agg_droi(rows), "fplan": agg_fplan(rows)}}
 
 
 # ================= 過小評価モーターキー・3連単EVモデル =================
