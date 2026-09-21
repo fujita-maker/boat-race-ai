@@ -1,0 +1,78 @@
+name: commit-odds3t
+
+# 判定時の3連単オッズ板(120点×全レース)を毎晩 GitHub に保存する。
+#  v90 から Render 側で毎レース保存している odds3t_YYYYMMDD.csv は Render のディスクにしか無く、
+#  再起動・再デプロイで消えうるうえ、分析側から読めなかった。
+#  これを data/odds3t/YYYYMMDD.csv にコミットして、
+#  「締切前のオッズで F案(合成EV) を検証し直す」ための材料にする。
+#  既にコミット済みの日は、行数が増えたときだけ差し替える（途中で落ちた応答で上書きしない）。
+
+on:
+  schedule:
+    - cron: "40 14 * * *"   # 毎日 23:40 JST（ledger 保存の10分後）
+  workflow_dispatch:
+    inputs:
+      dates:
+        description: "取得する日 YYYYMMDD をスペース区切り（空なら今日と前2日）"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+concurrency:
+  group: commit-odds3t
+  cancel-in-progress: false
+
+jobs:
+  commit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch odds boards from Render
+        env:
+          DATES: ${{ github.event.inputs.dates }}
+        run: |
+          mkdir -p data/odds3t
+          if [ -z "$DATES" ]; then
+            DATES="$(TZ=Asia/Tokyo date +%Y%m%d) $(TZ=Asia/Tokyo date -d '1 day ago' +%Y%m%d) $(TZ=Asia/Tokyo date -d '2 days ago' +%Y%m%d)"
+          fi
+          # Render が寝ている場合に備えて先に起こす
+          curl -s --max-time 90 "https://boat-race-ai-cxwk.onrender.com/api/tri/odds3t/status" > /dev/null || true
+          for d in $DATES; do
+            tmp="data/odds3t/$d.csv.new"
+            if curl -sSf --max-time 120 \
+                 "https://boat-race-ai-cxwk.onrender.com/api/tri/odds3t.csv?date=$d" -o "$tmp"; then
+              new=$(wc -l < "$tmp")
+              if [ "$new" -lt 2 ] || ! head -1 "$tmp" | grep -q "combo"; then
+                echo "$d: empty or wrong format ($new lines) - skip"
+                rm -f "$tmp"; continue
+              fi
+              old=0
+              [ -f "data/odds3t/$d.csv" ] && old=$(wc -l < "data/odds3t/$d.csv")
+              if [ "$new" -gt "$old" ]; then
+                mv "$tmp" "data/odds3t/$d.csv"
+                echo "$d: saved $((new - 1)) rows (was $((old > 0 ? old - 1 : 0)))"
+              else
+                echo "$d: no growth ($new <= $old) - keep existing"
+                rm -f "$tmp"
+              fi
+            else
+              echo "$d: fetch failed - keep existing"
+              rm -f "$tmp"
+            fi
+          done
+
+      - name: Commit if changed
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/odds3t
+          if git diff --staged --quiet; then
+            echo "no change - nothing to commit"
+          else
+            git pull --rebase origin main || true
+            git commit -m "chore: save odds3t boards (auto)"
+            git push
+          fi
