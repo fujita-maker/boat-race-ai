@@ -1,0 +1,86 @@
+name: archive-history
+
+# 過去レースデータ(boatraceopenapi の日別JSON)を data/hist/YYYYMMDD.json.gz に保存する。
+#  目的: モデル改良(2着・3着の割引／コース別補正／市場オッズとの合成)を過去数百日で検証するため。
+#  Claude の作業環境からは boatraceopenapi.github.io に直接出られないが、
+#  GitHub の raw 経由なら読めるので、ここに置いておけば検証できる。
+#  手動実行のみ(Actions → archive-history → Run workflow)。既にあるファイルは取り直さない。
+
+on:
+  workflow_dispatch:
+    inputs:
+      start:
+        description: "開始日 YYYYMMDD（空なら今日から days 日前）"
+        required: false
+        default: ""
+      days:
+        description: "何日分さかのぼるか（start が空のとき）"
+        required: false
+        default: "270"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: archive-history
+  cancel-in-progress: false
+
+jobs:
+  archive:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Download daily JSON
+        env:
+          START: ${{ github.event.inputs.start }}
+          DAYS: ${{ github.event.inputs.days }}
+        run: |
+          python - <<'EOF'
+          import os, gzip, json, time, datetime as dt, urllib.request
+          jst = dt.timezone(dt.timedelta(hours=9))
+          today = dt.datetime.now(jst).date()
+          if os.environ.get("START"):
+              s = dt.datetime.strptime(os.environ["START"], "%Y%m%d").date()
+          else:
+              s = today - dt.timedelta(days=int(os.environ.get("DAYS") or 270))
+          os.makedirs("data/hist", exist_ok=True)
+          ok = skip = miss = 0
+          d = s
+          while d < today:
+              hd = d.strftime("%Y%m%d")
+              path = f"data/hist/{hd}.json.gz"
+              if os.path.exists(path):
+                  skip += 1
+              else:
+                  url = f"https://boatraceopenapi.github.io/api/v1/{hd[:4]}/{hd}.json"
+                  try:
+                      with urllib.request.urlopen(url, timeout=30) as r:
+                          body = r.read()
+                      json.loads(body)                      # 壊れたJSONは保存しない
+                      with gzip.open(path, "wb") as f:
+                          f.write(body)
+                      ok += 1
+                  except Exception as e:
+                      miss += 1
+                      print("miss", hd, type(e).__name__)
+                  time.sleep(0.3)
+              d += dt.timedelta(days=1)
+          print(f"saved={ok} already={skip} missing={miss}")
+          EOF
+          du -sh data/hist
+      - name: Commit
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/hist
+          if git diff --cached --quiet; then
+            echo "変更なし"
+          else
+            git pull --rebase origin main || true
+            git commit -m "archive-history: $(date -u +'%Y%m%d %H:%MZ')"
+            git push
+          fi
