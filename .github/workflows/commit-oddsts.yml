@@ -1,0 +1,72 @@
+name: commit-oddsts
+
+# v125: オッズ時系列（締切15・10・5・2分前＋確定、単勝/複勝/2連単/3連単）を毎晩 GitHub に保存する。
+#  Render の /var/data にある oddsts_YYYYMMDD.jsonl を取得し、data/oddsts/YYYYMMDD.jsonl.gz にコミット。
+#  既にコミット済みの日は、行数が増えたときだけ差し替える（途中で落ちた応答で上書きしない）。
+
+on:
+  schedule:
+    - cron: "45 14 * * *"   # 毎日 23:45 JST
+  workflow_dispatch:
+    inputs:
+      dates:
+        description: "取得する日 YYYYMMDD をスペース区切り（空なら今日と前2日）"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+concurrency:
+  group: commit-oddsts
+  cancel-in-progress: false
+
+jobs:
+  commit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch odds time series from Render
+        env:
+          DATES: ${{ github.event.inputs.dates }}
+        run: |
+          mkdir -p data/oddsts
+          if [ -z "$DATES" ]; then
+            DATES="$(TZ=Asia/Tokyo date +%Y%m%d) $(TZ=Asia/Tokyo date -d '1 day ago' +%Y%m%d) $(TZ=Asia/Tokyo date -d '2 days ago' +%Y%m%d)"
+          fi
+          BASE="https://boat-race-ai-cxwk.onrender.com"
+          curl -s --max-time 90 "$BASE/api/odds/ts/status" > /dev/null || true
+          for d in $DATES; do
+            tmp="data/oddsts/$d.jsonl.new"
+            if curl -sSf --max-time 180 "$BASE/api/odds/ts.jsonl?date=$d" -o "$tmp"; then
+              new=$(grep -c '"slot"' "$tmp" || true)
+              if [ "$new" -lt 1 ]; then
+                echo "$d: empty - skip"; rm -f "$tmp"; continue
+              fi
+              old=0
+              [ -f "data/oddsts/$d.jsonl.gz" ] && old=$(gzip -dc "data/oddsts/$d.jsonl.gz" | grep -c '"slot"' || true)
+              if [ "$new" -gt "$old" ]; then
+                gzip -9 -c "$tmp" > "data/oddsts/$d.jsonl.gz"
+                echo "$d: saved $new snapshots (was $old)"
+              else
+                echo "$d: no growth ($new <= $old) - keep existing"
+              fi
+              rm -f "$tmp"
+            else
+              echo "$d: fetch failed - keep existing"; rm -f "$tmp"
+            fi
+          done
+
+      - name: Commit if changed
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/oddsts
+          if git diff --staged --quiet; then
+            echo "no change - nothing to commit"
+          else
+            git pull --rebase origin main || true
+            git commit -m "chore: save odds time series (auto)"
+            git push
+          fi
