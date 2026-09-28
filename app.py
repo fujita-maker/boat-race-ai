@@ -1732,7 +1732,12 @@ _UVP_EV_FLOOR = 1.5
 #   「買うレースの集合」は変えない。変わるのは「そのレースで何点買うか」だけ。
 #   None にすれば従来の4点固定に戻る。
 _UV_LEG_ODDS_CAP = 150.0
-_UV_LEG_EV_FLOOR = 1.5
+# v144(2026-09-28 藤田指示「150倍以下の4点に実践も切り替えたい」): 1点EV≥1.5 の条件を外し、150倍以下だけにする。
+#   実弾台帳 A案 130R(9/6〜9/27): 今(150倍以下∧EV1.5) 86R 的中7・回収237.5%・大穴3本抜き 前半15%/後半0%
+#   → 150倍以下の4点 130R 的中25(19.2%)・回収137.0%・収支+177,000・大穴3本抜き 前半48%/後半62%。
+#   150倍超の点は前の4点でも的中ゼロ(当たり25本はすべて150倍以下)。B案(同じ買い目)も 150倍以下4点 114.7%。
+#   数本の大当たりに頼らない形を優先。EVフロアに戻すなら 1.5 を入れる。
+_UV_LEG_EV_FLOOR = None
 _UVP_FILTERS = (
     ("uvp_o150", "オッズ150倍以下の点だけ買う", lambda q: _fnum(q.get("odds")) <= _UVP_ODDS_CAP),
     ("uvp_ev15", "1点のEV≥1.5の点だけ買う",
@@ -4875,7 +4880,7 @@ def _final_page_build():
                          "（6点×%d円〈9/28まで8点〉・v142から案1＝展示差0.15秒以下・1号艇の全国勝率4.74以上・波3cm以下のときだけ・判定は8点の板に一桁オッズ無し(最人気%.0f倍以上)かつ平均EV&ge;%.1f・2〜4号艇の明らかな強者が2着候補の外なら見送り）"
                          % (_FORM_MIN_FAST, _FORM_UNIT, _FORM_MIN_BOARD, _FORM_EV),
                          _form_stats(True), live=True, color=_FORM_COLOR, plan="E")
-               + (_uv_row("B案：≥40混戦（過小評価キー・買い目はA案と共通＝150倍以下かつ1点EV&ge;1.5の点だけ）", uv40, live=True, plan="B") if _B_LIVE else "")
+               + (_uv_row("B案：≥40混戦（過小評価キー・買い目はA案と共通＝4点のうち150倍以下の点だけ〈v144〉）", uv40, live=True, plan="B") if _B_LIVE else "")
                + _uv_row("A案：安定型 keyp&ge;10%（フラット・連敗ストップなし）", uv_stable, live=True, plan="A")
                + ((_uv_row("C案：中オッズEV 厳選（%s の1点×%d円・検証中）"
                           % (dict(_MIDEV_SHADOWS)[_MIDEV_DISPLAY], _MIDEV_UNIT), uv_midev_sh[_MIDEV_DISPLAY], live=True)
@@ -4888,7 +4893,7 @@ def _final_page_build():
                + (_uv_row("F案：改良モデル×市場の合成EV&ge;%.2f・%d〜%d倍の組を全部（1点%d円）%s" % (_F_EV, int(_F_LO), int(_F_HI), _F_UNIT, "" if _F_LIVE else "・記録のみ"), _fplan_stats(), live=_F_LIVE, color=_F_COLOR, plan="F") if _F_LIVE else "")
                + '<div class="tsub" style="margin-top:8px">'
                  + ('<b>2026-09-23からB案を実弾に戻し、F案は記録のみ</b>にしました。'
-                    'A案とB案は<b>同じ買い目</b>（4点のうちオッズ150倍以下かつ1点EV&ge;1.5の点だけ）なので、両方に「買い」が出ても買うのは1回分。'
+                    'A案とB案は<b>同じ買い目</b>（4点のうちオッズ150倍以下の点だけ〈v144からEV条件なし〉）なので、両方に「買い」が出ても買うのは1回分。'
                     'この買い目の条件は8/28〜9/22の266Rで実払戻253.2%ですが、条件を決めた後(9/19〜)はまだ26R・的中1です。'
                     'F案は実弾34Rで54.2%、買い目のほぼ全部がモデルの過大評価に乗っていたため外しました。'
                     + ('C案・D案・E案も並行してライブ検証中。' if _C_LIVE else
@@ -5197,7 +5202,7 @@ def _final_page_build():
             h += '</table><div class="tsub" style="margin:2px 0 4px">このレースで買う合計 <b>%s円</b></div>' % f"{int(_tot):,}"
         else:
             h += '<div class="tsub" style="margin:4px 0">実弾の枠（A案・D案・E案・F案・G案・I案・I2〜I4案・波乱）はどれも条件に当てはまらないため買いません。%s</div>' % (
-                ('（過小評価キーは立っているが、4点ともオッズ150倍以下かつ1点EV1.5以上を満たさないため買わない）'
+                ('（過小評価キーは立っているが、4点とも150倍超のため買わない）'
                  if (uv and (uv.get("dec40") == "買い" or uv.get("dec_stable") == "買い") and not uv.get("picks"))
                  else ('（安定型は該当したが、当日連敗ストップ中のため買わない）' if _planA_stopped else '')))
         # 過小評価キー（毎レース 買い/見送り を表示）
@@ -5736,7 +5741,7 @@ def _final_page_build():
                 'B案（≥40混戦）と≥55は2026-09-21から記録のみなので、候補には出しません（同じレースが該当する場合は「対象」欄に小さく表示）。'
                 '最終判定は各レース締切５分前に最新オッズで確定（下の一覧に追加）。')
              +
-             '<b>v85以降、実際に買うのはこの4点のうち「オッズ150倍以下かつ1点EV1.5以上」だけ</b>'
+             '<b>v144以降、実際に買うのはこの4点のうち「オッズ150倍以下」の点だけ</b>'
              'なので、締切前に1〜2点へ減るか、0点＝見送りになることがあります（過去実測で4割強のレースが見送り）。'
              '過去半年BT ≥40混戦91.9%／≥55約97%／安定型約90%＝いずれも100%未満の検証ツール。<br>'
              '<b>「買い目」は朝の時点の予定（4点×1,000円＝1レース4,000円。キーを1着に置く2点と、'
@@ -9079,7 +9084,9 @@ def undervalue_pick(race, odds_map):
                 "picks": [], "picks_all": picks_all, "total": 0,
                 "basket_ev": basket_ev, "basket_ev8": basket_ev8,
                 "reason": (f"{X}号艇の過小評価キーは立っているが、買い目4点のいずれも"
-                           f"オッズ{int(_UV_LEG_ODDS_CAP)}倍以下かつ1点EV{_UV_LEG_EV_FLOOR}以上を満たさないため買わない(v85)。")}
+                           f"オッズ{int(_UV_LEG_ODDS_CAP)}倍以下"
+                           + (f"かつ1点EV{_UV_LEG_EV_FLOOR}以上" if _UV_LEG_EV_FLOOR is not None else "")
+                           + "を満たさないため買わない。")}
     reason = (f"{X}号艇＝モーター2連率{mot[X]:.0f}%(機力{mot_rank[X]}位)なのに全国2連率{nat[X]:.0f}%(人気{nat_rank[X]}位)＝"
               f"実力の割に不人気で高オッズ。本命{P}号艇を軸に、{X}を3着中心で絡めて{len(picks)}点。"
               f"モデルは{X}の3着以内を{top3[X]*100:.0f}%と評価。")
