@@ -1,0 +1,53 @@
+name: collect-ai-sites
+
+# 梅吉AI(umepyon.com)と AI BOAT RACE(aiboatrace.jp)の予想を毎日ためる。
+#  どちらも過去日は翌日に404で消えるので、当日のうちに保存するしかない。
+#  ・梅吉: 全場・全R・全券種のAI確率。取得済みのRはスキップ(確率は最初に取った値が正本)。
+#  ・AI BOAT RACE: 1日約80R。展示後に順次ページが出るので30分ごとに回り、推奨目が変わったら snaps に追加。
+#  保存先: data/umekichi/YYYYMMDD.json , data/aiboatrace/YYYYMMDD.json
+#  手動実行可(Run workflow)。
+
+on:
+  schedule:
+    - cron: "*/30 23 * * *"     # 08:00〜08:30 JST
+    - cron: "*/30 0-12 * * *"   # 09:00〜21:30 JST
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: collect-ai-sites
+  cancel-in-progress: false
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install deps
+        run: pip install requests beautifulsoup4 lxml
+      - name: Umekichi
+        continue-on-error: true
+        run: python umekichi_scrape.py --out data/umekichi
+      - name: AI BOAT RACE
+        continue-on-error: true
+        run: python aiboatrace_scrape.py --out data/aiboatrace
+      - name: Commit
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/umekichi data/aiboatrace 2>/dev/null || true
+          if git diff --cached --quiet; then
+            echo "変更なし"; exit 0
+          fi
+          git commit -m "ai sites (umekichi/aiboatrace): $(date -u +'%Y-%m-%d %H:%MZ')"
+          for i in 1 2 3 4 5; do
+            git pull --rebase --autostash && git push && exit 0
+            sleep $((i*7))
+          done
+          exit 1
