@@ -33,7 +33,10 @@ jobs:
         run: |
           mkdir -p data
           # 失敗しても既存ファイルを壊さないよう一時ファイルへ取得
-          if curl -sSf --max-time 90 \
+          # v171(2026-10-08): 台帳が28MB超まで育ち、90秒で取り切れずに黙って失敗していた(10/5〜)。
+          # 待ち時間を10分に延ばし、3回まで取り直す。
+          curl -s --max-time 90 "https://boat-race-ai-cxwk.onrender.com/api/tri/settle_status" > /dev/null || true
+          if curl -sSf --max-time 600 --retry 3 --retry-delay 30 --retry-all-errors \
                "https://boat-race-ai-cxwk.onrender.com/api/tri/ledger.csv" \
                -o data/tri_render_ledger.csv.new; then
             # ヘッダ行以外に最低1行あるときだけ差し替え（空応答で上書きしない）
@@ -53,6 +56,8 @@ jobs:
           else
             echo "fetch failed (Render sleeping or error) - keep existing file"
             rm -f data/tri_render_ledger.csv.new
+            # v171: 失敗を「成功」で終わらせない。赤くしてGitHubからメールが来るようにする
+            exit 1
           fi
 
       - name: Commit if changed
