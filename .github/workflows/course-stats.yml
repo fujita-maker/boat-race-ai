@@ -1,0 +1,50 @@
+name: course-stats
+
+# v202: 選手のコース別成績 data/course_stats.json を毎晩、前日までの openapi の結果で足す。
+#  手動実行で fan に期別ファイル名（例 fan2510）を入れると、公式ファン手帳のコース別成績を data/fan_course.json に取り込む。
+
+on:
+  schedule:
+    - cron: "37 18 * * *"   # 毎日 03:37 JST
+  workflow_dispatch:
+    inputs:
+      fan:
+        description: "ファン手帳の期別ファイル名（例 fan2510）。空なら取り込まない"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+concurrency:
+  group: course-stats
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Update course stats from openapi
+        run: python tools/course_stats.py update
+      - name: Import fan handbook (manual only)
+        if: ${{ github.event.inputs.fan != '' && github.event.inputs.fan != null }}
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq lhasa
+          python tools/import_fan.py "${{ github.event.inputs.fan }}"
+      - name: Commit if changed
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/course_stats.json data/fan_course.json 2>/dev/null || git add data/course_stats.json
+          if git diff --staged --quiet; then
+            echo "no change - nothing to commit"
+          else
+            git pull --rebase origin main || true
+            git commit -m "chore: update course stats (auto)"
+            git push
+          fi
