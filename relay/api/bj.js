@@ -4,7 +4,7 @@
 module.exports = async (req, res) => {
   const key = process.env.RELAY_KEY || "";
   const q = req.query || {};
-  if (!key || q.key !== key) { res.status(403).send("bad key"); return; }
+  if (key && q.key !== key) { res.status(403).send("bad key"); return; }
   const p = String(q.p || "");
   if (!/^\/owpc\/pc\/race\/[a-z0-9]+\?[A-Za-z0-9=&_%-]+$/.test(p)) { res.status(400).send("bad path"); return; }
   try {
