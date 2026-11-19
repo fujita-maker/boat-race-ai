@@ -1,0 +1,4 @@
+{
+  "regions": ["hnd1"],
+  "functions": { "api/bj.js": { "maxDuration": 25 } }
+}
