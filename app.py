@@ -77,7 +77,13 @@ def _bj_get(url, *a, **kw):
         return _requests_get_orig(url, *a, **kw)
     kw = dict(kw)
     kw["params"] = {"p": m.group(1), "key": _BJ_RELAY_KEY}
-    kw["timeout"] = max(float(kw.get("timeout") or 15), 20)
+    # v230b(2026-11-21): 公式の直前情報・結果は timeout=(接続6秒, 読み25秒) のタプルで呼ぶため、
+    #   float(タプル) で TypeError → 中継に行く前に全件失敗していた（11/19 v229〜。展示「待ち」・公式結果の精算が止まる）。
+    _to = kw.get("timeout")
+    if isinstance(_to, (tuple, list)) and len(_to) == 2:
+        kw["timeout"] = (float(_to[0] or 6), max(float(_to[1] or 15), 20))
+    else:
+        kw["timeout"] = max(float(_to or 15), 20)
     _t0 = time.time()
     try:
         r = _requests_get_orig(_BJ_RELAY_URL, *a, **kw)
